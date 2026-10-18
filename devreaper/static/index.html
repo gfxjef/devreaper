@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="devreaper-token" content="__TOKEN__">
+<title>DevReaper</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%230a0a0a'/%3E%3Cpath d='M32 13a19 19 0 0 0 0 38z' fill='%23ef4444'/%3E%3Cpath d='M32 13a19 19 0 0 1 0 38z' fill='%2322c55e'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>DevReaper</h1>
+    <div class="stat"><b id="ram">—</b><span id="ram-sub">RAM del sistema</span></div>
+    <div class="stat"><b id="dev">—</b><span id="dev-sub">procesos de desarrollo</span></div>
+    <div class="stat"><b id="claude">—</b><span id="claude-sub">sesiones de Claude</span></div>
+    <div class="stat"><b id="infra">—</b><span>Docker y WSL</span></div>
+    <div class="stat" id="orph-stat"><b id="orph">—</b><span>huérfanos</span></div>
+    <div class="stat"><b id="freed">—</b><span>liberados en 7 días</span></div>
+    <div class="stat next"><b id="next">—</b><span id="next-sub">próximo cierre automático</span></div>
+    <button class="theme-btn" id="theme" type="button"></button>
+  </header>
+
+  <div class="load" id="load" aria-label="Memoria por grupo de procesos"></div>
+  <div class="load-caption" id="load-caption"></div>
+
+  <div class="toolbar">
+    <span id="bulk" class="toolbar" style="margin:0"></span>
+    <button class="btn" id="preview" title="Marca en la tabla, sin cerrar nada, lo que cerraría el próximo ciclo">Ver qué cerraría</button>
+    <span class="sep" aria-hidden="true"></span>
+    <input type="text" inputmode="numeric" class="port-input" id="port" placeholder="Puerto" aria-label="Puerto a liberar">
+    <button class="btn" id="free-port">Liberar puerto</button>
+    <span class="grow"></span>
+    <input type="text" class="filter" id="filter" placeholder="Filtrar  ( / )" aria-label="Filtrar">
+    <label class="check"><input type="checkbox" id="show-all"> Ver todos</label>
+    <span class="offline" id="offline" hidden>Sin conexión con DevReaper</span>
+  </div>
+
+  <nav class="views" role="tablist" aria-label="Vista">
+    <button role="tab" data-view="proc">Procesos <span id="n-proc"></span></button>
+    <button role="tab" data-view="sess">Sesiones de Claude <span id="n-sess"></span></button>
+    <button role="tab" data-view="ports">Puertos <span id="n-ports"></span></button>
+    <button role="tab" data-view="wt">Worktrees <span id="n-wt"></span></button>
+    <button role="tab" data-view="infra">Docker y WSL <span id="n-infra"></span></button>
+    <button role="tab" data-view="ram">RAM 7 días</button>
+  </nav>
+
+  <div class="banner" id="preview-banner" hidden><span id="preview-text"></span>
+    <button class="btn" id="preview-exit">Salir de la vista previa</button></div>
+
+  <section id="view-proc" class="scroll"><table>
+    <thead><tr>
+      <th>Estado</th><th>Proceso</th><th>Puertos</th><th class="r">RAM</th><th class="r">Abierto hace</th>
+      <th class="hide-sm">Sesión de Claude</th><th></th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table></section>
+
+  <section id="view-sess" class="scroll narrow" hidden><table>
+    <thead><tr>
+      <th>Estado</th><th>Sesión</th><th>Procesos que lanzó</th><th class="r">RAM total</th>
+      <th class="r">Abierta hace</th><th class="r">Sin actividad</th><th></th>
+    </tr></thead>
+    <tbody id="sessions"></tbody>
+  </table></section>
+
+  <section id="view-ports" hidden>
+    <div class="viewhead"><p id="ports-head"></p></div>
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>Puerto</th><th>Lo usa ahora</th><th>Acceso</th><th class="r">RAM</th>
+        <th class="hide-sm">Lo usaron (7 días)</th><th></th>
+      </tr></thead>
+      <tbody id="ports"></tbody>
+    </table></div>
+  </section>
+
+  <section id="view-wt" hidden>
+    <div class="viewhead"><p id="wt-head"></p><button class="btn small" id="wt-refresh">Actualizar</button></div>
+    <div class="scroll narrow"><table>
+      <thead><tr>
+        <th>Worktree</th><th>Rama</th><th class="r">Último commit</th><th>Corriendo ahí</th>
+        <th class="hide-sm">Sesiones de Claude</th><th class="r">RAM</th><th></th>
+      </tr></thead>
+      <tbody id="worktrees"></tbody>
+    </table></div>
+  </section>
+
+  <section id="view-infra" hidden>
+    <div class="card" id="wsl-card"></div>
+    <div class="card" id="docker-card"></div>
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>Contenedor</th><th class="hide-sm">Proyecto</th><th>Puertos</th><th class="r">RAM</th><th>Estado</th><th></th>
+      </tr></thead>
+      <tbody id="containers"></tbody>
+    </table></div>
+  </section>
+
+  <section id="view-ram" hidden>
+    <div class="viewhead">
+      <p id="ram-head">Una muestra por minuto mientras DevReaper está abierto.</p>
+      <div class="seg-ctl" role="group" aria-label="Rango">
+        <button data-hours="24">24 h</button><button data-hours="168">7 días</button>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <div class="legend">
+        <span><i class="sw dev"></i>Procesos de desarrollo</span>
+        <span><i class="sw claude"></i>Sesiones de Claude</span>
+        <span><i class="sw infra"></i>Docker y WSL</span>
+        <span><i class="sw rest"></i>Resto del sistema</span>
+      </div>
+      <div class="chart" id="ram-chart"></div>
+      <div class="tip" id="ram-tip" hidden></div>
+    </div>
+    <details id="d-ramtable">
+      <summary>Ver como tabla</summary>
+      <div class="body"><table>
+        <thead><tr><th>Hora</th><th class="r">Desarrollo</th><th class="r">Claude</th><th class="r">Docker y WSL</th>
+          <th class="r">Resto</th><th class="r">RAM usada</th><th>Lo más pesado</th></tr></thead>
+        <tbody id="ram-table"></tbody>
+      </table></div>
+    </details>
+  </section>
+
+  <details id="d-log">
+    <summary>Historial de cierres <span id="n-log"></span></summary>
+    <div class="body"><table><thead><tr>
+      <th>Cuándo</th><th>Qué</th><th>Puertos</th><th class="r">RAM</th><th>Motivo</th><th>Desde</th>
+    </tr></thead><tbody id="log"></tbody></table></div>
+  </details>
+
+  <details id="d-settings">
+    <summary>Ajustes</summary>
+    <div class="body">
+      <div class="settings">
+        <label class="inline"><input type="checkbox" data-setting="auto_enabled"> Cierre automático activado</label>
+        <label>Ejecutar el ciclo cada (horas)<input type="number" min="1" data-setting="auto_interval_hours"></label>
+        <label>Cerrar lo que lleve abierto más de (horas)<input type="number" min="1" data-setting="auto_max_age_hours"></label>
+        <label>Avisar si la RAM pasa de (%)<input type="number" min="50" max="99" data-setting="ram_alert_percent"></label>
+        <label>Mostrar si usa más de (MB)<input type="number" min="1" data-setting="show_min_mb"></label>
+        <label>Mostrar si lleva abierto más de (horas)<input type="number" min="1" data-setting="show_min_age_hours"></label>
+        <label>Sesión inactiva tras (horas sin actividad)<input type="number" min="0.25" step="0.25" data-setting="inactive_after_hours"></label>
+        <label>Procesos vigilados (separados por coma)<input type="text" data-setting="dev_names"></label>
+        <label class="wide">Carpetas donde buscar repos con worktrees (separadas por punto y coma)<input type="text" data-setting="project_roots"></label>
+      </div>
+      <p class="section-title">Iniciar con Windows <span id="startup-state"></span></p>
+      <div id="startup-help" class="help">
+        <p>DevReaper no lo configura solo: Bitdefender bloquea los programas que se agregan al inicio de Windows
+          por su cuenta. Hazlo tú en tres pasos:</p>
+        <ol>
+          <li>Pulsa <b>Abrir carpetas</b>: se abren la carpeta de Inicio y la de DevReaper con <b>DevReaper (inicio).cmd</b> seleccionado.</li>
+          <li>Arrastra ese archivo a la carpeta de Inicio con el <b>botón derecho</b> del mouse.</li>
+          <li>Elige <b>Crear acceso directo aquí</b>.</li>
+        </ol>
+        <button class="btn" id="open-startup">Abrir carpetas</button>
+      </div>
+      <p class="section-title">Puertos protegidos</p>
+      <p class="help">Nunca se cierran: ni en el ciclo automático, ni en cierres masivos, ni al cerrar una sesión,
+        un worktree o WSL. También puedes protegerlos con el candado de cada puerto.</p>
+      <div class="chips"><span id="excluded"></span>
+        <input type="text" inputmode="numeric" class="port-input" id="ex-port" placeholder="Puerto" aria-label="Puerto a proteger">
+        <button class="btn" id="ex-add">Proteger</button></div>
+    </div>
+  </details>
+</main>
+<div id="toast" role="status"></div>
+<script src="/app.js"></script>
+</body>
+</html>
