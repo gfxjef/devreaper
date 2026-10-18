@@ -3,10 +3,11 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 
 import psutil
 
-from . import infra, reaper, scanner, sessions, startup, worktrees
+from . import agents, infra, projects, reaper, scanner, sessions, startup, worktrees
 
 log = logging.getLogger("devreaper")
 
@@ -15,9 +16,11 @@ AUTO_CHECK_EVERY_S = 30
 INFRA_EVERY_S = 30
 SAMPLE_EVERY_S = 60
 WORKTREES_EVERY_S = 300
+HISTORY_EVERY_S = 600
 PRUNE_EVERY_S = 3600
 ALERT_COOLDOWN_S = 1800
 PORT_TOUCH_EVERY_S = 60
+LIVE_POINTS = 450  # 15 minutes of live data at one point per scan
 EMPTY_INFRA = {"vm_mb": 0.0, "vm_running": False, "docker_host_mb": 0.0, "docker_running": False,
                "containers": [], "docker_cli": False, "distros": [], "updated": 0}
 
@@ -33,8 +36,13 @@ class App:
         self._scanned_at = 0.0
         self._port_touched = {}
         self._last = {"sample": 0.0, "alert": 0.0, "prune": 0.0, "worktrees": 0.0}
+        self._activity = agents.Activity()
+        self._live = deque(maxlen=LIVE_POINTS)
+        self._group_live = {}
+        self._history = {"dirs": [], "at": 0.0}
         self._stop = threading.Event()
         self.on_scan = None  # callback(summary) for the tray icon
+        psutil.cpu_percent(None)  # prime the system CPU counter
         if self.db.settings()["auto_last_run"] == 0:
             # First launch: give the user a full interval to set excluded ports before anything is closed.
             self.db.set_setting("auto_last_run", time.time())
@@ -43,10 +51,15 @@ class App:
     def rescan(self):
         settings = self.db.settings()
         found = sessions.load_sessions(settings["inactive_after_hours"])
-        groups, listeners = scanner.scan(settings, found, self.db, self.db.excluded_ports())
+        groups, listeners, agent_map = scanner.scan(settings, found, self.db, self.db.excluded_ports(),
+                                                    activity=self._activity)
+        keep = self.db.kept_alive()
+        for g in groups:
+            g["keep_until"] = keep.get(g["id"], 0)
         with self._lock:
-            self._groups, self._listeners, self._sessions = groups, listeners, found
+            self._groups, self._listeners, self._sessions = groups, listeners, agent_map
             self._scanned_at = time.time()
+        self._record_live(groups, agent_map)
         self._record_ports(groups)
         if self.on_scan:
             self.on_scan(self.summary())
@@ -56,9 +69,37 @@ class App:
         with self._lock:
             return list(self._groups)
 
+    def agents(self):
+        with self._lock:
+            return dict(self._sessions)
+
     def containers(self):
         with self._lock:
             return list(self._infra["containers"])
+
+    def _record_live(self, groups, agent_map):
+        now = time.time()
+        vm = psutil.virtual_memory()
+        with self._lock:
+            inf = self._infra
+        self._live.append({
+            "ts": round(now, 1),
+            "used_mb": round((vm.total - vm.available) / 2**20, 1),
+            "dev_mb": round(sum(g["mb"] for g in groups), 1),
+            "agents_mb": round(sum(a["mb"] for a in agent_map.values()), 1),
+            "infra_mb": round(inf["vm_mb"] + inf["docker_host_mb"], 1),
+            "cpu": psutil.cpu_percent(None),
+        })
+        alive = set()
+        for g in groups:
+            alive.add(g["id"])
+            self._group_live.setdefault(g["id"], deque(maxlen=LIVE_POINTS)).append((round(now, 1), g["mb"], g["cpu"]))
+        for gid in [k for k in self._group_live if k not in alive]:
+            del self._group_live[gid]
+
+    def live(self):
+        """The last 15 minutes: system points plus per-group [ts, mb, cpu] series."""
+        return {"points": list(self._live), "groups": {k: list(v) for k, v in self._group_live.items()}}
 
     def _record_ports(self, groups):
         now = time.time()
@@ -78,11 +119,19 @@ class App:
             self._infra = snap
 
     def refresh_worktrees(self):
+        """Repos come from where things run now, from projects seen before, and from agents' own history."""
+        now = time.time()
         with self._lock:
-            extra = [g["worktree"] for g in self._groups if g["worktree"]]
-            extra += [s["cwd"] for s in self._sessions.values()]
-            extra += [c["workdir"] for c in self._infra["containers"]]
-        result = worktrees.scan_worktrees(self.db.settings()["project_roots"], extra)
+            groups, found, containers = list(self._groups), list(self._sessions.values()), list(self._infra["containers"])
+        extra = [g["worktree"] for g in groups if g["worktree"]] + [s["cwd"] for s in found]
+        extra += [c["workdir"] for c in containers]
+        live_repos = projects.discover(extra + [g["cwd"] for g in groups if g["cwd"]])
+        if live_repos:
+            self.db.touch_projects(sorted(live_repos), now)
+        if now - self._history["at"] >= HISTORY_EVERY_S:
+            self._history = {"dirs": projects.history_dirs(), "at": now}
+        repos = live_repos | projects.discover(self._history["dirs"] + self.db.projects())
+        result = worktrees.scan_worktrees(self.db.settings()["project_roots"], extra, repos)
         result["updated"] = time.time()
         with self._lock:
             self._worktrees = result
@@ -93,7 +142,8 @@ class App:
         with self._lock:
             groups, found, inf = list(self._groups), dict(self._sessions), dict(self._infra)
         items = [{"kind": "proceso", "label": g["label"], "mb": g["mb"]} for g in groups]
-        items += [{"kind": "sesión", "label": s["name"], "mb": round(s["mb"], 1)} for s in found.values()]
+        items += [{"kind": "agente", "label": f"{s.get('agent', 'Claude Code')} · {s['name']}", "mb": round(s["mb"], 1)}
+                  for s in found.values()]
         items += [{"kind": "contenedor", "label": c["name"], "mb": c["mb"]} for c in inf["containers"]]
         if inf["vm_running"]:
             items.append({"kind": "WSL", "label": "Máquina virtual WSL", "mb": inf["vm_mb"]})
@@ -125,15 +175,19 @@ class App:
         with self._lock:
             found, inf = dict(self._sessions), dict(self._infra)
         orph = reaper.orphans(groups, excluded)
+        due = reaper.due_for_auto(groups, settings["auto_max_age_hours"], excluded)
         return {
             "dev_mb": round(sum(g["mb"] for g in groups), 1),
             "orphans": len(orph),
             "orphans_mb": round(sum(g["mb"] for g in orph), 1),
-            "due": len(reaper.due_for_auto(groups, settings["auto_max_age_hours"], excluded)),
+            "due": len(due),
+            "due_mb": round(sum(g["mb"] for g in due), 1),
             "ram_percent": psutil.virtual_memory().percent,
             "sessions_mb": round(sum(s["mb"] for s in found.values()), 1),
+            "agents_active": sum(1 for s in found.values() if s["state"] == "active"),
             "infra_mb": round(inf["vm_mb"] + inf["docker_host_mb"], 1),
             "freed_7d_mb": self.db.freed_since(time.time() - 7 * 86400),
+            "cpu": self._live[-1]["cpu"] if self._live else 0.0,
         }
 
     def state(self):
@@ -144,11 +198,13 @@ class App:
             inf, wts, scanned_at = dict(self._infra), dict(self._worktrees), self._scanned_at
         excluded = self.db.excluded_ports()
         now = time.time()
+        groups = [dict(g, keep_reason=reaper.keep_reason(g, settings["auto_max_age_hours"], excluded, now))
+                  for g in groups]
         return {
             "now": now,
             "scanned_at": scanned_at,
             "system": {"total_mb": vm.total / 2**20, "used_mb": (vm.total - vm.available) / 2**20,
-                       "percent": vm.percent},
+                       "percent": vm.percent, "cpus": scanner.NCPU},
             "groups": groups,
             "sessions": session_rows(found, groups, excluded, now),
             "ports": port_rows(groups, listeners, inf["containers"], excluded, self.db.port_history()),
@@ -162,6 +218,7 @@ class App:
             "startup": startup.is_enabled(),
             "log": self.db.kill_log(),
             "summary": self.summary(),
+            "live": self._live[-1] if self._live else None,
         }
 
     # ---------- actions ----------
@@ -194,29 +251,77 @@ class App:
                 return c
         raise KeyError(f"el contenedor {container_id} ya no está corriendo")
 
-    def _kill_session(self, pid, origin):
-        """Close a Claude Code session: its dev groups, then claude.exe and its helpers. Protected ports survive."""
+    def _agent(self, pid):
         with self._lock:
             s = self._sessions.get(pid)
         if s is None:
-            raise KeyError(f"la sesión {pid} ya no existe")
+            raise KeyError(f"el agente {pid} ya no está abierto")
+        return s
+
+    def _kill_session(self, pid, origin):
+        """Close a terminal agent (Claude Code, Codex…): its dev groups, then the agent. Protected ports survive.
+        Editors (Cursor, VS Code) are never closed from here; their processes can be, with kill-agent-procs."""
+        s = self._agent(pid)
+        if s.get("kind") != "cli":
+            raise ValueError(f"{s.get('agent', 'ese programa')} se cierra desde su ventana; "
+                             "aquí solo puedo cerrar los procesos que lanzó")
         proc = psutil.Process(pid)
-        if proc.name().lower() != "claude.exe" or (s["proc_start"] and abs(proc.create_time() - s["proc_start"]) > 5):
-            raise ValueError(f"el PID {pid} ya no es esa sesión de Claude")
+        info = agents.classify(proc.name(), proc.exe(), " ".join(proc.cmdline()))
+        if not info or info[0] != s["agent_key"] or abs(proc.create_time() - s["create_time"]) > 1:
+            raise ValueError(f"el PID {pid} ya no es ese agente")
         reaper.ensure_user_process(proc)
         excluded = self.db.excluded_ports()
         groups = [g for g in self.groups() if g["session"] and g["session"]["pid"] == pid]
         protected = [g for g in groups if set(g["ports"]) & excluded]
         keep = {p for g in protected for p in g["pids"]}
-        result = self._kill([g for g in groups if g not in protected], f"sesión {s['name']}", origin)
+        label = f"{s['agent']} · {s['name']}"
+        result = self._kill([g for g in groups if g not in protected], label, origin)
         if reaper.kill_tree(proc, skip=keep):
-            self.db.log_kill({"label": f"Sesión de Claude {s['name']}", "pids": [pid], "ports": [],
-                              "mb": round(s["mb"], 1), "age_hours": round((time.time() - s["started"]) / 3600, 2),
-                              "cmd": f"claude.exe (cwd {s['cwd']})"}, "cerrar sesión", origin)
-            log.info("closed claude session %s pid=%s kept=%s", s["name"], pid, sorted(keep))
+            self.db.log_kill({"label": label, "pids": [pid], "ports": [], "mb": round(s["mb"], 1),
+                              "age_hours": round((time.time() - s["started"]) / 3600, 2),
+                              "cmd": f"{proc.name()} (cwd {s['cwd']})"}, "cerrar agente", origin)
+            log.info("closed agent %s pid=%s kept=%s", label, pid, sorted(keep))
             result["freed_mb"] = round(result["freed_mb"] + s["mb"], 1)
         self.rescan()
         result["kept"] = len(protected)
+        return result
+
+    def idle_agents(self, hours):
+        """Terminal agents with no activity for `hours` (closing one loses nothing: sessions can be resumed)."""
+        now = time.time()
+        return [s for s in self.agents().values() if s.get("kind") == "cli" and s["state"] == "inactive"
+                and s.get("updated") and now - s["updated"] >= hours * 3600]
+
+    def _kill_idle_agents(self, hours, origin):
+        total = {"killed": 0, "freed_mb": 0.0, "kept": 0}
+        for s in self.idle_agents(hours):
+            try:
+                r = self._kill_session(s["pid"], origin)
+            except (KeyError, ValueError, psutil.Error) as e:
+                log.info("skipped idle agent %s: %s", s["pid"], e)
+                continue
+            total["killed"] += r["killed"] + 1
+            total["freed_mb"] = round(total["freed_mb"] + r["freed_mb"], 1)
+            total["kept"] += r["kept"]
+        return total
+
+    def _kill_agent_procs(self, pid, origin):
+        """Close what an agent launched, leaving the agent (or editor) itself open."""
+        s = self._agent(pid)
+        excluded = self.db.excluded_ports()
+        groups = [g for g in self.groups() if g["session"] and g["session"]["pid"] == pid]
+        free = [g for g in groups if not set(g["ports"]) & excluded]
+        result = self._kill(free, f"procesos de {s.get('agent', 'agente')} · {s['name']}", origin)
+        result["kept"] = len(groups) - len(free)
+        return result
+
+    def _kill_selected(self, ids, origin):
+        excluded = self.db.excluded_ports()
+        by_id = {g["id"]: g for g in self.groups()}
+        chosen = [by_id[i] for i in ids if i in by_id]
+        free = [g for g in chosen if not set(g["ports"]) & excluded]
+        result = self._kill(free, "selección", origin)
+        result["kept"] = len(chosen) - len(free)
         return result
 
     def _kill_worktree(self, path, origin):
@@ -288,6 +393,20 @@ class App:
             return self._kill([self._group(body["id"])], "manual", origin)
         if name == "kill-session":
             return self._kill_session(int(body["pid"]), origin)
+        if name == "kill-agent-procs":
+            return self._kill_agent_procs(int(body["pid"]), origin)
+        if name == "kill-idle-agents":
+            return self._kill_idle_agents(float(body.get("hours", 24)), origin)
+        if name == "kill-selected":
+            return self._kill_selected([str(i) for i in body["ids"]], origin)
+        if name == "keep-alive":
+            g = self._group(str(body["id"]))
+            hours = float(body["hours"])
+            if not 0 <= hours <= 24 * 7:
+                raise ValueError("se puede posponer entre 0 y 168 horas")
+            self.db.keep_alive(g["id"], hours, g["label"])
+            self.rescan()
+            return {"ok": True}
         if name == "kill-worktree":
             return self._kill_worktree(str(body["path"]), origin)
         if name == "kill-orphans":
@@ -315,6 +434,12 @@ class App:
             return {"ok": True}
         if name == "run-auto":
             return self.run_auto_cycle(origin)
+        if name == "reveal":
+            path = str(body["path"])
+            if not os.path.isdir(path):
+                raise ValueError("esa carpeta ya no existe")
+            os.startfile(path)
+            return {"ok": True}
         if name == "open-startup":
             startup.open_startup_folder()
             startup.reveal_launcher()
@@ -384,17 +509,20 @@ def _gb(mb):
 
 
 def session_rows(found, groups, excluded_ports, now):
-    """One row per live Claude session with the dev processes it launched, heaviest first."""
+    """One row per open agent (Claude Code, Codex, Cursor…) with the dev processes it launched, heaviest first."""
     rows = []
     for s in found.values():
         mine = [g for g in groups if g["session"] and g["session"]["pid"] == s["pid"]]
         groups_mb = sum(g["mb"] for g in mine)
         rows.append({
             "pid": s["pid"], "name": s["name"], "cwd": s["cwd"], "state": s["state"],
-            "age_hours": round((now - s["started"]) / 3600, 2) if s["started"] else None,
-            "idle_hours": round((now - s["updated"]) / 3600, 2),
+            "agent": s.get("agent", "Claude Code"), "agent_key": s.get("agent_key", "claude"),
+            "kind": s.get("kind", "cli"), "closable": s.get("closable", True), "cpu": s.get("cpu", 0.0),
+            "age_hours": round((now - s["started"]) / 3600, 2) if s.get("started") else None,
+            "idle_hours": round((now - s["updated"]) / 3600, 2) if s.get("updated") else None,
             "mb": round(s["mb"], 1),
-            "groups": [{"label": g["label"], "ports": g["ports"], "mb": g["mb"]} for g in mine],
+            "groups": [{"id": g["id"], "label": g["label"], "ports": g["ports"], "mb": g["mb"], "cpu": g.get("cpu", 0),
+                        "kind": g.get("kind", "")} for g in mine],
             "groups_mb": round(groups_mb, 1),
             "total_mb": round(s["mb"] + groups_mb, 1),
             "protected": sum(1 for g in mine if set(g["ports"]) & excluded_ports),
@@ -445,7 +573,7 @@ def port_rows(groups, listeners, containers, excluded, history):
 
 def worktree_members(path, is_main, groups, containers, found=()):
     """(groups, containers, sessions) that belong to a worktree. Linked worktrees match by their
-    `.worktrees\<name>` path; the main checkout matches by folder, excluding anything under .worktrees."""
+    `.worktrees/<name>` path; the main checkout matches by folder, excluding anything under .worktrees."""
     key = worktrees.norm(path)
 
     def inside(p):
@@ -473,9 +601,10 @@ def worktree_rows(wt_rows, groups, containers, found, excluded):
         mb = round(sum(g["mb"] for g in gs) + sum(c["mb"] for c in cs), 1)
         out.append({
             **w,
-            "groups": [{"label": g["label"], "ports": g["ports"], "mb": g["mb"], "kind": g["kind"]} for g in gs],
+            "groups": [{"id": g["id"], "label": g["label"], "ports": g["ports"], "mb": g["mb"], "kind": g["kind"]}
+                       for g in gs],
             "containers": [{"name": c["name"], "ports": [p["host_port"] for p in c["ports"]], "mb": c["mb"]} for c in cs],
-            "sessions": [{"name": s["name"], "state": s["state"]} for s in ss],
+            "sessions": [{"name": s["name"], "state": s["state"], "agent": s.get("agent", "Claude Code")} for s in ss],
             "mb": mb,
             "ports": sorted({p for g in gs for p in g["ports"]} | {p["host_port"] for c in cs for p in c["ports"]}),
             "protected": protected,

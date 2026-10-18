@@ -125,7 +125,7 @@ def test_scan_finds_a_real_child_process_with_its_port():
         deadline = time.time() + 10
         groups = []
         while time.time() < deadline:
-            groups, listeners = scanner.scan(db.settings(), {}, db, set(), self_pid=-1)
+            groups, listeners, _ = scanner.scan(db.settings(), {}, db, set(), self_pid=-1)
             mine = [g for g in groups if child.pid in g["pids"]]
             if mine and mine[0]["ports"]:
                 break

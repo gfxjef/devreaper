@@ -123,7 +123,21 @@ def classify(wt, base, merged, refs, is_main):
     return "open"
 
 
+def plain_repo(repo, git):
+    """A repo without linked worktrees: one row, branch from .git/HEAD, a single git call for the date."""
+    try:
+        head = (Path(repo) / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return []
+    branch = head.removeprefix("ref: refs/heads/") if head.startswith("ref:") else None
+    date = quiet.run([git, "-C", repo, "log", "-1", "--format=%ct"], timeout=5).strip()
+    return [{"repo": repo, "repo_name": os.path.basename(repo), "path": repo, "name": "(principal)",
+             "branch": branch, "base": None, "status": "main", "last_commit": int(date) if date.isdigit() else 0}]
+
+
 def repo_worktrees(repo, git):
+    if not (Path(repo) / ".git" / "worktrees").is_dir():
+        return plain_repo(repo, git)
     listing = quiet.run([git, "-C", repo, "worktree", "list", "--porcelain"])
     if not listing:
         return []
@@ -150,17 +164,20 @@ def repo_worktrees(repo, git):
     return rows
 
 
-def scan_worktrees(roots, extra_paths=()):
-    """All worktrees of repos found under `roots` or mentioned by running processes/sessions."""
+def scan_worktrees(roots, extra_paths=(), repos=()):
+    """All worktrees of: repos with linked worktrees under `roots`, repos mentioned by running processes,
+    and `repos` (discovered from where agents work)."""
     git = shutil.which("git")
     if not git:
         return {"rows": [], "error": "No encontré git en el PATH."}
-    repos = find_repos(roots)
+    found = {norm(r): r for r in find_repos(roots)}
+    for r in repos:
+        found.setdefault(norm(r), r)
     for p in extra_paths:
         wt = worktree_of(p)
         if wt and repo_of(wt):
-            repos.add(repo_of(wt))
+            found.setdefault(norm(repo_of(wt)), repo_of(wt))
     rows = []
-    for repo in sorted(repos):
+    for repo in sorted(found.values(), key=str.lower):
         rows.extend(repo_worktrees(repo, git))
     return {"rows": rows, "error": None}

@@ -4,33 +4,15 @@ import logging
 import sys
 import threading
 import urllib.request
-import webbrowser
 
 import pystray
-from PIL import Image, ImageDraw
 
+from . import tray
 from .app import App
 from .db import DB, default_path
 from .server import HOST, PORT, make_server
 
 URL = f"http://{HOST}:{PORT}/"
-COLORS = {"ok": (34, 197, 94), "warn": (234, 179, 8), "bad": (239, 68, 68)}
-
-
-def icon_image(level: str) -> Image.Image:
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(24, 24, 27))
-    d.ellipse((16, 16, 48, 48), fill=COLORS[level])
-    return img
-
-
-def level_of(summary) -> str:
-    if summary["ram_percent"] >= 90 or summary["orphans_mb"] >= 1024:
-        return "bad"
-    if summary["due"] or summary["orphans"] or summary["dev_mb"] >= 4096:
-        return "warn"
-    return "ok"
 
 
 def already_running() -> bool:
@@ -50,7 +32,7 @@ def main():
     at_logon = "--startup" in sys.argv
     if already_running():
         if not at_logon:
-            webbrowser.open(URL)
+            tray.open_url(URL, as_app=True)
         return
 
     db = DB()
@@ -59,37 +41,40 @@ def main():
     server = make_server(app)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    state = {"level": None}
+    shown = {"look": None}
+    icon = None
 
-    def open_panel(icon=None, item=None):
-        webbrowser.open(URL)
+    def run(action):
+        kind, body = action
+        if kind == "open":
+            return tray.open_url(body, as_app=body.startswith(URL))
+        if kind == "quit":
+            app.stop()
+            server.shutdown()
+            return icon.stop()
 
-    def bulk(name):
-        return lambda icon, item: app.action(name, {}, origin="bandeja")
+        def work():  # off the tray thread: closing can take seconds and must not freeze the menu
+            try:
+                result = app.action(kind, body, origin="bandeja")
+                if kind not in ("settings", "keep-alive"):
+                    icon.notify(tray.result_text(result), "DevReaper")
+            except (ValueError, KeyError, OSError) as e:
+                icon.notify(str(e), "DevReaper: no se pudo")
+        tray.run_in_thread(work)
 
-    def quit_app(icon, item):
-        app.stop()
-        server.shutdown()
-        icon.stop()
+    def model():
+        return tray.menu_model(app.state(), URL)
 
-    icon = pystray.Icon(
-        "devreaper", icon_image("ok"), "DevReaper",
-        menu=pystray.Menu(
-            pystray.MenuItem("Abrir panel", open_panel, default=True),
-            pystray.MenuItem("Cerrar huérfanos", bulk("kill-orphans")),
-            pystray.MenuItem("Ejecutar ciclo de cierre ahora", bulk("run-auto")),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Salir", quit_app),
-        ),
-    )
+    icon = tray.make_icon_class(pystray)(
+        "devreaper", tray.icon_image("ok"), "DevReaper", menu=tray.build_pystray_menu(pystray, model, run))
 
     def on_scan(summary):
-        level = level_of(summary)
-        if level != state["level"]:
-            state["level"] = level
-            icon.icon = icon_image(level)
-        icon.title = (f"DevReaper · Dev {summary['dev_mb'] / 1024:.1f} GB · "
-                      f"{summary['orphans']} huérfanos · RAM {summary['ram_percent']:.0f}%")
+        level = tray.level_of(summary)
+        look = (level, round(summary["ram_percent"] / 5) * 5)  # redraw only when the ring visibly changes
+        if look != shown["look"]:
+            shown["look"] = look
+            icon.icon = tray.icon_image(*look)
+        icon.title = tray.tooltip(summary)
 
     app.notify = lambda title, msg: icon.notify(msg, title)
     app.on_scan = on_scan
@@ -98,7 +83,7 @@ def main():
         icon.visible = True
         app.start()
         if not at_logon:
-            open_panel()
+            tray.open_url(URL, as_app=True)
 
     icon.run(setup)
 

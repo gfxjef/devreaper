@@ -106,3 +106,22 @@ Pedido: "haz todo esto, mi idea principal es el cierre de puertos y liberación 
 | Origen | `kill_log.origin` (panel/bandeja/automático) y `cmd`; total liberado 7 días |
 | Front | JS y CSS fuera del HTML; CSP `script-src 'self'` |
 | Puerto protegido inicial | 3990 (waha), a pedido del usuario: "no lo detengas porque lo uso actualmente" |
+
+## Ampliación 2026-10-18: varios agentes, bandeja y panel completo
+
+Pedido: Java, Go, .NET y Ruby en la lista; el cierre automático debe respetar sesiones activas ("si está
+activa es porque posiblemente está en uso"); no depender del formato interno de Claude Code; descubrir los
+proyectos solos, pensando en usuarios de Claude Code, Cursor, Codex u otros; ver procesos y RAM desde el ícono;
+panel en tiempo real que use toda la ventana y con mejores opciones de cierre.
+
+| Pieza | Decisión |
+|---|---|
+| Agentes (`agents.py`) | El árbol de procesos manda: un proceso pertenece al primer agente entre sus padres. Firmas por nombre/ruta/comando para CLIs (Claude Code, Codex, Gemini, Copilot, Aider, OpenCode…), editores (Cursor, VS Code, Windsurf, JetBrains…) y apps de escritorio. Los procesos auxiliares de un agente (helpers de Electron, el wrapper de node) se agrupan bajo su raíz |
+| Actividad | Prioridad: archivo de sesión de Claude y hora del último mensaje `user`/`assistant` de la transcripción (el mtime miente: Claude añade líneas de mantenimiento a sesiones quietas), sesiones de Codex; si no hay nada legible, CPU promediada por 60 s (CLI 3 %, app 6 %, editor 10 % de un núcleo). Sin evidencia, activo durante las primeras 2 h de observación |
+| Cierre automático | Salta: puerto protegido, pospuesto (`keep_alive`), agente activo, CPU en las últimas 2 h (`in_use`). `reaper.keep_reason` da la razón y se muestra en cada fila |
+| Cierres nuevos | Selección múltiple, cerrar los procesos de un agente sin cerrarlo, cerrar agentes de terminal sin uso > 24 h, posponer 24 h / 7 días. Un editor nunca se cierra desde DevReaper |
+| Proyectos (`projects.py`) | cwd de agentes y procesos + `~/.claude.json`, `~/.gemini/projects.json`, sesiones de Codex y `workspaceStorage` de editores VS Code (30 días); raíz git resuelta (worktrees vía `.git` file). Tabla `projects` recuerda los vistos. `project_roots` queda como extra opcional (vacío por defecto) |
+| Grupos | La RAM y CPU incluyen hijos que no son de desarrollo (esbuild, binario de `go run`); la agrupación no cruza agentes |
+| Bandeja (`tray.py`) | Ícono = anillo de RAM con el color del nivel. Menú reconstruido en el hilo de UI justo antes de mostrarse (subclase de `pystray.Icon`): procesos, agentes y puertos con submenús y acciones. Las acciones corren en otro hilo y avisan con una notificación |
+| Panel | Ventana Edge `--app`. Rejilla a pantalla completa: rail, cabecera con RAM en vivo (ring buffer de 15 min en el servidor, `/api/live`), lista con scroll propio y encabezado fijo, inspector con RAM/CPU del grupo. Inspector flotante < 1500 px, rail de íconos < 1280 px, una columna < 720 px |
+| Robustez | `process_iter` comparte objetos `Process` entre hilos: se leen atributos con llamadas directas/`as_dict`, no `p.info`. El servidor lee el cuerpo antes de responder 403 (evita resets en Windows) |

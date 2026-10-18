@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 HOST, PORT = "127.0.0.1", 7777
+MAX_BODY = 1 << 20
 STATIC = Path(__file__).with_name("static")
 INDEX = STATIC / "index.html"
 ASSETS = {"/app.js": ("app.js", "text/javascript; charset=utf-8"),
@@ -61,6 +62,8 @@ def make_server(app, port=PORT):
                 return self._send(200, (STATIC / name).read_bytes(), ctype)
             if url.path == "/api/state":
                 return self._json(200, app.state())
+            if url.path == "/api/live":
+                return self._json(200, app.live())
             if url.path == "/api/ram":
                 try:
                     hours = min(max(float(parse_qs(url.query).get("hours", ["168"])[0]), 1), 168)
@@ -72,14 +75,20 @@ def make_server(app, port=PORT):
             self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            # Read the body before any reply: on Windows, closing a socket with unread data sends a reset and the
+            # client sees ConnectionAbortedError instead of the 403.
+            try:
+                length = min(int(self.headers.get("Content-Length") or 0), MAX_BODY)
+            except ValueError:
+                length = 0
+            raw = self.rfile.read(length) if length else b""
             origin = self.headers.get("Origin")
             if (self.headers.get("Host") not in allowed_hosts
                     or self.headers.get("X-DevReaper-Token") != token
                     or (origin is not None and origin.removeprefix("http://") not in allowed_hosts)):
                 return self._json(403, {"error": "forbidden"})
             try:
-                length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(length) or b"{}")
+                body = json.loads(raw or b"{}")
                 result = app.action(self.path.removeprefix("/api/"), body, origin="panel")
             except (ValueError, KeyError) as e:
                 return self._json(400, {"error": str(e)})

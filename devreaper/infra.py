@@ -52,9 +52,21 @@ def host_processes():
     """RAM of the WSL VM and of Docker Desktop's own Windows processes."""
     vm_mb = docker_mb = 0.0
     vm_running = docker_running = False
-    for p in psutil.process_iter(["name", "memory_info"]):
-        name = (p.info["name"] or "").lower()
-        mem = p.info["memory_info"].rss / 2**20 if p.info["memory_info"] else 0.0
+    # Direct calls, not process_iter(attrs): process_iter shares Process objects across threads, so `p.info`
+    # can be overwritten mid-loop by the scanner's own iteration. Memory is read only for the few names that matter.
+    for p in psutil.process_iter():
+        try:
+            name = (p.name() or "").lower()
+        except psutil.Error:
+            continue
+        if name not in VM_NAMES and name not in DOCKER_HOST_NAMES:
+            continue
+        try:
+            mem = p.memory_info().rss / 2**20
+        except psutil.AccessDenied:
+            mem = 0.0  # vmmem runs as SYSTEM on some setups: still counts as running
+        except psutil.Error:
+            continue
         if name in VM_NAMES:
             vm_mb += mem
             vm_running = True

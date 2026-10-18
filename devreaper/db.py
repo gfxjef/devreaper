@@ -1,4 +1,4 @@
-"""SQLite storage: settings, excluded ports, process lineage and kill log."""
+"""SQLite storage: settings, protected ports, process lineage, kill log, postponed closes and known projects."""
 import json
 import os
 import sqlite3
@@ -14,8 +14,9 @@ DEFAULTS = {
     "show_min_mb": 300,
     "show_min_age_hours": 24,
     "inactive_after_hours": 2,
-    "dev_names": ["node", "python", "pythonw", "uvicorn", "bun", "deno"],
-    "project_roots": [str(Path.home() / "Desktop" / "works")],
+    "dev_names": ["node", "python", "pythonw", "uvicorn", "bun", "deno", "java", "go", "dotnet", "ruby"],
+    # Extra folders to search for repos. Usually empty: projects are discovered from where agents work.
+    "project_roots": [],
     "ram_alert_percent": 90,
 }
 
@@ -34,8 +35,13 @@ CREATE TABLE IF NOT EXISTS port_history (
     first_seen REAL NOT NULL, last_seen REAL NOT NULL, PRIMARY KEY (port, label));
 CREATE TABLE IF NOT EXISTS ram_samples (
     ts REAL PRIMARY KEY, used_mb REAL, dev_mb REAL, claude_mb REAL, infra_mb REAL, top TEXT);
+CREATE TABLE IF NOT EXISTS keep_alive (group_id TEXT PRIMARY KEY, until REAL NOT NULL, label TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS projects (path TEXT PRIMARY KEY, last_seen REAL NOT NULL);
 """
-MIGRATIONS = {"kill_log": {"origin": "TEXT DEFAULT ''", "cmd": "TEXT DEFAULT ''"}}
+MIGRATIONS = {"kill_log": {"origin": "TEXT DEFAULT ''", "cmd": "TEXT DEFAULT ''"},
+              "lineage": {"agent": "TEXT DEFAULT ''"}}
+# Runtimes added to the default watch list after release, merged once into lists users already saved.
+DEV_NAMES_V2 = ["java", "go", "dotnet", "ruby"]
 
 
 def default_path() -> Path:
@@ -49,6 +55,7 @@ class DB:
         if str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._remembered = {}
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.executescript(SCHEMA)
         for table, columns in MIGRATIONS.items():
@@ -56,6 +63,13 @@ class DB:
             for column, decl in columns.items():
                 if column not in have:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        saved = self._conn.execute("SELECT value FROM settings WHERE key = 'dev_names'").fetchone()
+        done = self._conn.execute("SELECT 1 FROM settings WHERE key = '_dev_names_v2'").fetchone()
+        if saved and not done:
+            names = json.loads(saved[0])
+            names += [n for n in DEV_NAMES_V2 if n not in names]
+            self._conn.execute("UPDATE settings SET value = ? WHERE key = 'dev_names'", (json.dumps(names),))
+        self._conn.execute("INSERT OR IGNORE INTO settings VALUES ('_dev_names_v2', 'true')")
         self._conn.commit()
 
     def _exec(self, sql, args=()):
@@ -89,20 +103,26 @@ class DB:
 
     # lineage
     def remember(self, pid, create_time, session):
-        self._exec(
-            "INSERT OR REPLACE INTO lineage VALUES (?, ?, ?, ?, ?, ?)",
-            (pid, round(create_time, 3), session["id"], session["name"], session["cwd"], session["pid"]),
-        )
+        """Link a dev process to the agent that launched it (written once per process, then only on change)."""
+        key = (pid, round(create_time, 3))
+        row = (session["id"], session["name"], session["cwd"], session["pid"], session.get("agent", ""))
+        if self._remembered.get(key) == row:
+            return
+        self._exec("INSERT OR REPLACE INTO lineage (pid, create_time, session_id, session_name, session_cwd,"
+                   " claude_pid, agent) VALUES (?, ?, ?, ?, ?, ?, ?)", key + row)
+        self._remembered[key] = row
+        if len(self._remembered) > 5000:
+            self._remembered.clear()
 
     def recall(self, pid, create_time):
         rows = self._exec(
-            "SELECT session_id, session_name, session_cwd, claude_pid FROM lineage WHERE pid = ? AND create_time = ?",
-            (pid, round(create_time, 3)),
+            "SELECT session_id, session_name, session_cwd, claude_pid, agent FROM lineage"
+            " WHERE pid = ? AND create_time = ?", (pid, round(create_time, 3)),
         )
         if not rows:
             return None
-        sid, name, cwd, cpid = rows[0]
-        return {"id": sid, "name": name, "cwd": cwd, "pid": cpid}
+        sid, name, cwd, cpid, agent = rows[0]
+        return {"id": sid, "name": name, "cwd": cwd, "pid": cpid, "agent": agent or "Claude Code"}
 
     def prune_lineage(self, older_than_days=14):
         cutoff = time.time() - older_than_days * 86400
@@ -154,6 +174,28 @@ class DB:
                 {"label": label, "worktree": wt, "kind": kind, "first_seen": first, "last_seen": last})
         return out
 
+    # postponed closes ("keep alive"): the auto cycle and bulk closes skip these groups until `until`
+    def keep_alive(self, group_id, hours, label=""):
+        if hours <= 0:
+            self._exec("DELETE FROM keep_alive WHERE group_id = ?", (group_id,))
+        else:
+            self._exec("INSERT OR REPLACE INTO keep_alive VALUES (?, ?, ?)",
+                       (group_id, time.time() + hours * 3600, label))
+
+    def kept_alive(self) -> dict:
+        return dict(self._exec("SELECT group_id, until FROM keep_alive WHERE until > ?", (time.time(),)))
+
+    # projects discovered from where agents ran
+    def touch_projects(self, paths, now=None):
+        now = now or time.time()
+        with self._lock:
+            self._conn.executemany("INSERT OR REPLACE INTO projects VALUES (?, ?)", [(p, now) for p in paths])
+            self._conn.commit()
+
+    def projects(self, days=30) -> list:
+        return [r[0] for r in self._exec("SELECT path FROM projects WHERE last_seen >= ?",
+                                         (time.time() - days * 86400,))]
+
     # RAM samples
     def add_sample(self, ts, used_mb, dev_mb, claude_mb, infra_mb, top):
         self._exec("INSERT OR REPLACE INTO ram_samples VALUES (?, ?, ?, ?, ?, ?)",
@@ -171,6 +213,8 @@ class DB:
         now = time.time()
         self._exec("DELETE FROM ram_samples WHERE ts < ?", (now - sample_days * 86400,))
         self._exec("DELETE FROM port_history WHERE last_seen < ?", (now - port_days * 86400,))
+        self._exec("DELETE FROM keep_alive WHERE until < ?", (now,))
+        self._exec("DELETE FROM projects WHERE last_seen < ?", (now - port_days * 86400,))
         self.prune_lineage(lineage_days)
 
 

@@ -21,16 +21,23 @@ def session_status(session: dict, now: float, inactive_after_hours: float) -> st
     return "active" if idle_s < inactive_after_hours * 3600 else "inactive"
 
 
+def _ms(data, *keys):
+    """Largest of the given millisecond timestamps, in seconds (keys come and go between versions)."""
+    values = [data[k] for k in keys if isinstance(data.get(k), (int, float))]
+    return max(values) / 1000 if values else 0
+
+
 def parse_session(data: dict) -> dict:
+    proc_start = data.get("procStart") or data.get("procStartFt")
     return {
         "pid": int(data["pid"]),
         "id": data.get("sessionId", ""),
         "name": data.get("name") or Path(data.get("cwd", "")).name,
         "cwd": data.get("cwd", ""),
         "status": data.get("status", ""),
-        "started": data.get("startedAt", 0) / 1000,
-        "updated": data.get("updatedAt", data.get("startedAt", 0)) / 1000,
-        "proc_start": filetime_to_epoch(data["procStart"]) if data.get("procStart") else None,
+        "started": _ms(data, "startedAt"),
+        "updated": _ms(data, "updatedAt", "statusUpdatedAt", "startedAt"),
+        "proc_start": filetime_to_epoch(proc_start) if proc_start else None,
     }
 
 

@@ -1,12 +1,16 @@
-"""Collect dev processes, group them into process trees and attach Claude sessions."""
+"""Collect dev processes, group them into process trees and attach the coding agent that launched them."""
 import os
 import re
 import time
 
 import psutil
 
+from . import agents as agents_mod
 from .infra import INFRA_NAMES
 from .worktrees import worktree_of
+
+NCPU = psutil.cpu_count() or 1
+GROUP_ACTIVE = 0.015  # CPU share of one core above which a dev server counts as being used
 
 IGNORE_FRAGMENTS = ("\\adobe\\",)
 GENERIC_DIRS = {"frontend", "backend", "web", "app", "client", "server", "api", "src"}
@@ -40,8 +44,32 @@ def kind_of(cmdline: str, exe: str = "") -> str:
         return "vite"
     if "uvicorn" in c:
         return "uvicorn"
+    exe_l = (exe or "").lower()
+    name = os.path.basename(exe_l).removesuffix(".exe") or c.split(" ", 1)[0].strip('"').lower()
+    if "gradle" in c:
+        return "gradle"
+    if "plexus-classworlds" in c or "maven" in c:
+        return "maven"
+    if "spring-boot" in c or "springframework.boot" in c:
+        return "spring boot"
+    if name in ("java", "javaw") or "java.exe" in c:
+        return "java"
+    if "dotnet" in name or "dotnet.exe" in c:
+        if "watch" in c:
+            return "dotnet watch"
+        if "msbuild" in c or "vbcscompiler" in c or "build-server" in c:
+            return "msbuild"
+        return "dotnet"
+    if name == "go" or c.startswith("go ") or "go.exe" in c:
+        return "go run" if " run" in c else "go"
+    if "rails" in c or "puma" in c:
+        return "rails"
+    if name == "ruby" or "ruby.exe" in c:
+        return "ruby"
     if "python" in c:
         return "python"
+    if name in ("bun", "deno"):
+        return name
     return "node"
 
 
@@ -87,8 +115,12 @@ def snapshot():
     """All processes as {pid: rec}. Cheap attributes only."""
     ppids = _ppid_map()
     procs = {}
-    for p in psutil.process_iter(["pid", "name", "create_time"] + ([] if ppids is not None else ["ppid"])):
-        info = p.info
+    attrs = ["pid", "name", "create_time"] + ([] if ppids is not None else ["ppid"])
+    for p in psutil.process_iter():
+        try:
+            info = p.as_dict(attrs)  # not p.info: process_iter shares Process objects across threads
+        except psutil.Error:
+            continue
         if info["create_time"] is None:
             continue
         ppid = ppids.get(info["pid"]) if ppids is not None else info["ppid"]
@@ -132,15 +164,16 @@ def owned_by(rec, user) -> bool:
     return _owner_cache[key]
 
 
-def build_groups(dev, procs):
-    """dev: {pid: rec} of dev processes. Returns {root_pid: [member pids]} (root first)."""
+def build_groups(dev, procs, stop=frozenset()):
+    """dev: {pid: rec} of dev processes. Returns {root_pid: [member pids]} (root first).
+    Climbing stops at PIDs in `stop` (agents), so servers an agent launched never merge with what launched it."""
     groups = {}
     for pid, rec in dev.items():
         root = rec
         cur = rec
         while True:
             parent = parent_of(cur, procs)
-            if parent is None:
+            if parent is None or parent["pid"] in stop:
                 break
             if parent["pid"] in dev:
                 root = parent
@@ -151,15 +184,29 @@ def build_groups(dev, procs):
     return groups
 
 
-def find_session(rec, procs, sessions):
+def find_session(rec, procs, sessions, member_of=None):
+    """First agent among the ancestors. `member_of` maps agent helper PIDs to their agent's root PID."""
     cur = rec
     while True:
         parent = parent_of(cur, procs)
         if parent is None:
             return None
-        if parent["pid"] in sessions:
-            return sessions[parent["pid"]]
+        root = member_of.get(parent["pid"], parent["pid"]) if member_of else parent["pid"]
+        if root in sessions:
+            return sessions[root]
         cur = parent
+
+
+def descendants(root_pid, children, skip):
+    """Every live descendant of root_pid, not descending into PIDs in `skip`."""
+    out, stack = [], list(children.get(root_pid, ()))
+    while stack:
+        pid = stack.pop()
+        if pid in skip:
+            continue
+        out.append(pid)
+        stack.extend(children.get(pid, ()))
+    return out
 
 
 def find_session_by_path(texts, sessions, home=None):
@@ -176,8 +223,77 @@ def find_session_by_path(texts, sessions, home=None):
     return best
 
 
-def scan(settings, sessions, db, excluded_ports, self_pid=None):
+_cwd_cache = {}
+_disk = {"codex": {}, "codex_at": 0.0, "claude": {}}
+DISK_EVERY_S = 30
+
+
+def _cwd(rec):
+    key = (rec["pid"], rec["create_time"])
+    if key not in _cwd_cache:
+        _cwd_cache[key] = agents_mod.agent_cwd(rec["pid"])
+        if len(_cwd_cache) > 2000:
+            _cwd_cache.clear()
+    return _cwd_cache[key]
+
+
+def _disk_activity(a, cwd, session_id, now):
+    """Last activity an agent left on disk (Claude transcripts, Codex rollouts), refreshed every 30 s."""
+    if a["agent_key"] == "claude":
+        key = (a["pid"], a["create_time"])
+        hit = _disk["claude"].get(key)
+        if hit is None or now - hit[0] >= DISK_EVERY_S:
+            hit = (now, agents_mod.claude_last_turn(cwd, a["cmd"], session_id))
+            _disk["claude"][key] = hit
+        return hit[1]
+    if a["agent_key"] == "codex":
+        if now - _disk["codex_at"] >= DISK_EVERY_S:
+            _disk["codex"], _disk["codex_at"] = agents_mod.codex_activity(), now
+        return _disk["codex"].get(os.path.normcase(os.path.normpath(cwd))) if cwd else None
+    return None
+
+
+def build_agents(procs, found, user, activity, settings, now):
+    """{root pid: agent} with cwd, RAM, CPU and state. Claude session files, when present, add name and status."""
+    agents, member_of = agents_mod.find_agents(procs, user)
+    helpers = {}
+    for pid, root in member_of.items():
+        helpers.setdefault(root, []).append(pid)
+    out = {}
+    for pid, a in agents.items():
+        rec = procs[pid]
+        s = found.get(pid) or {}
+        cwd = s.get("cwd") or _cwd(rec)
+        key = ("agent", pid, rec["create_time"])
+        share = activity.observe(key, agents_mod.tree_cpu(helpers[pid], procs),
+                                 agents_mod.CPU_ACTIVE[a["kind"]], now)
+        # What the agent wrote down (session file, last turn in its transcript) is exact; CPU is only the fallback
+        # for agents that leave nothing readable (editors), since idle CLIs have occasional background bursts.
+        written = [t for t in (s.get("updated"), _disk_activity(a, cwd, s.get("id", ""), now)) if t]
+        last = max(written) if written else activity.last_active(key)
+        out[pid] = {
+            **a,
+            "id": f"{a['agent_key']}:{pid}:{int(rec['create_time'])}",
+            "session_id": s.get("id", ""),
+            "name": s.get("name") or os.path.basename(cwd.rstrip("\\/")) or a["agent"],
+            "cwd": cwd,
+            "status": s.get("status", ""),
+            "started": s.get("started") or rec["create_time"],
+            "updated": last,
+            "proc_start": s.get("proc_start"),
+            "state": agents_mod.agent_state(last, now, settings["inactive_after_hours"], activity.started,
+                                            s.get("status") == "busy"),
+            "mb": agents_mod.tree_mb(helpers[pid], procs),
+            "cpu": round(share / NCPU * 100, 1),
+            "closable": a["kind"] == "cli",
+        }
+    return out, member_of
+
+
+def scan(settings, sessions, db, excluded_ports, self_pid=None, activity=None):
+    """Returns (groups, listeners, agents). `sessions`: Claude session files keyed by claude.exe PID."""
     now = time.time()
+    activity = activity or agents_mod.Activity(now)
     self_pid = self_pid or os.getpid()
     dev_names = {n.lower() for n in settings["dev_names"]}
     procs = snapshot()
@@ -201,29 +317,31 @@ def scan(settings, sessions, db, excluded_ports, self_pid=None):
         user = psutil.Process(os.getpid()).username().lower()
     except psutil.Error:
         user = None
+    agents, member_of = build_agents(procs, sessions, user, activity, settings, now)
     dev = {}
     for pid, rec in procs.items():
-        if pid in own or pid in sessions:
+        if pid in own or pid in member_of or pid in sessions:
             continue
         stem = rec["name"].lower().removesuffix(".exe")
         if stem not in dev_names and stem != "chrome":
             continue
         p = rec["proc"]
-        try:
-            exe = p.exe()
-        except psutil.Error:
-            exe = ""
-        try:
-            cmd = " ".join(p.cmdline())
-        except psutil.Error:
-            cmd = ""
+        exe = rec.get("exe")
+        if exe is None:
+            try:
+                exe = p.exe()
+            except psutil.Error:
+                exe = ""
+        cmd = rec.get("cmd")
+        if cmd is None:
+            try:
+                cmd = " ".join(p.cmdline())
+            except psutil.Error:
+                cmd = ""
         if not is_dev(rec["name"], exe, cmd, dev_names):
             continue
-        try:
-            if user and p.username().lower() != user:
-                continue  # never list (or close) processes of SYSTEM, services or other accounts
-        except psutil.Error:
-            continue
+        if not owned_by(rec, user):
+            continue  # never list (or close) processes of SYSTEM, services or other accounts
         try:
             mb = p.memory_info().rss / 2**20
         except psutil.Error:
@@ -231,14 +349,20 @@ def scan(settings, sessions, db, excluded_ports, self_pid=None):
         rec.update(exe=exe, cmd=cmd, mb=mb)
         dev[pid] = rec
 
+    children = {}
+    for pid, rec in procs.items():
+        parent = parent_of(rec, procs)
+        if parent is not None:
+            children.setdefault(parent["pid"], []).append(pid)
     sockets = listening_sockets()
     ports_by_pid, exposed_by_pid = {}, {}
     for pid, port, ip in sockets:
         ports_by_pid.setdefault(pid, set()).add(port)
         if ip not in LOCAL_IPS:
             exposed_by_pid.setdefault(pid, set()).add(port)
-    out = []
-    for root_pid, members in build_groups(dev, procs).items():
+    cli_agents = {pid: a for pid, a in agents.items() if a["kind"] == "cli"}
+    out, live = [], set()
+    for root_pid, members in build_groups(dev, procs, stop=set(member_of)).items():
         root = dev[root_pid]
         try:
             cwd = root["proc"].cwd()
@@ -251,32 +375,42 @@ def scan(settings, sessions, db, excluded_ports, self_pid=None):
                 break
         kinds = [kind_of(dev[p]["cmd"], dev[p]["exe"]) for p in members]
         kind = next((k for k in kinds if k not in ("node", "python")), kinds[0])
-        ports = sorted({port for p in members for port in ports_by_pid.get(p, ())})
-        exposed = sorted({port for p in members for port in exposed_by_pid.get(p, ())})
+        # helpers that are not dev processes themselves (esbuild, the binary `go run` builds, conhost…)
+        extra = [p for p in descendants(root_pid, children, set(member_of) | own) if p not in dev]
+        pids = members + extra
+        ports = sorted({port for p in pids for port in ports_by_pid.get(p, ())})
+        exposed = sorted({port for p in pids for port in exposed_by_pid.get(p, ())})
         wt = worktree_of(cwd) or next((w for w in (worktree_of(dev[p]["cmd"]) for p in members) if w), None)
 
-        session = find_session(root, procs, sessions)
+        session = find_session(root, procs, agents, member_of)
         if session is None and parent_of(root, procs) is None and db.recall(root_pid, root["create_time"]) is None:
-            session = find_session_by_path([cwd] + [dev[p]["cmd"] for p in members], sessions)
+            session = find_session_by_path([cwd] + [dev[p]["cmd"] for p in members], cli_agents)
         if session:
             db.remember(root_pid, root["create_time"], session)
             state = session["state"]
         else:
             known = db.recall(root_pid, root["create_time"])
-            if known and known["pid"] in sessions:
-                session, state = sessions[known["pid"]], sessions[known["pid"]]["state"]
+            alive = agents.get(known["pid"]) if known else None
+            # legacy rows stored Claude's sessionId instead of the agent's process identity
+            if alive and (known["id"] == alive["id"] or ":" not in (known["id"] or "")):
+                session, state = alive, alive["state"]
             elif known:
                 session, state = known, "orphan"
             else:
                 state = "none"
 
+        gid = f"{root_pid}-{root['create_time']:.3f}"
+        live.add(("group", gid))
+        mb = sum(dev[p]["mb"] for p in members) + agents_mod.tree_mb(extra, procs)
+        share = activity.observe(("group", gid), agents_mod.tree_cpu(pids, procs), GROUP_ACTIVE, now)
+        used = activity.last_active(("group", gid))
+        idle_from = used or max(activity.started, root["create_time"])
         age_h = (now - root["create_time"]) / 3600
-        mb = sum(dev[p]["mb"] for p in members)
         out.append({
-            "id": f"{root_pid}-{root['create_time']:.3f}",
+            "id": gid,
             "root_pid": root_pid,
             "create_time": root["create_time"],
-            "pids": members,
+            "pids": pids,
             "label": label or root["name"],
             "kind": kind,
             "cmd": root["cmd"][:300],
@@ -286,12 +420,20 @@ def scan(settings, sessions, db, excluded_ports, self_pid=None):
             "cwd": cwd,
             "excluded": bool(set(ports) & excluded_ports),
             "mb": round(mb, 1),
+            "cpu": round(share / NCPU * 100, 1),
+            "idle_hours": round((now - idle_from) / 3600, 2),
+            "idle_known": used is not None,
+            "in_use": used is not None and now - used < settings["inactive_after_hours"] * 3600,
             "age_hours": round(age_h, 2),
             "state": state,
-            "session": {"name": session["name"], "id": session["id"], "pid": session["pid"]} if session else None,
+            "session": {"name": session["name"], "id": session["id"], "pid": session["pid"],
+                        "agent": session.get("agent") or "Claude Code", "kind": session.get("kind") or "cli"}
+            if session else None,
             "visible": mb >= settings["show_min_mb"] or age_h >= settings["show_min_age_hours"] or state == "orphan",
         })
     out.sort(key=lambda g: g["mb"], reverse=True)
+    live |= {("agent", pid, a["create_time"]) for pid, a in agents.items()}
+    activity.forget(live)
 
     group_of = {pid: g["id"] for g in out for pid in g["pids"]}
     listeners = []
@@ -305,4 +447,4 @@ def scan(settings, sessions, db, excluded_ports, self_pid=None):
             "infra": name.lower() in INFRA_NAMES,
             "exposed": ip not in LOCAL_IPS,
         })
-    return out, listeners
+    return out, listeners, agents

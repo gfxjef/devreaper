@@ -1,14 +1,35 @@
 """Killing process trees and the auto-close policy."""
+import time
+
 import psutil
 
 
-def due_for_auto(groups, max_age_hours, excluded_ports):
-    """Groups the auto-close cycle should kill: old enough and not holding an excluded port."""
-    return [g for g in groups if g["age_hours"] >= max_age_hours and not set(g["ports"]) & set(excluded_ports)]
+def keep_reason(group, max_age_hours, excluded_ports, now=None):
+    """Why the auto-close cycle spares this group, or None when it is due. Anything that suggests the user is
+    still relying on it wins: a protected port, an active agent, recent CPU use, or a postponed close."""
+    now = now or time.time()
+    if set(group["ports"]) & set(excluded_ports):
+        return "protegido"
+    if group.get("keep_until", 0) > now:
+        return "pospuesto"
+    if group.get("state") == "active":
+        return "agente activo"
+    if group.get("in_use"):
+        return "en uso"
+    if group["age_hours"] < max_age_hours:
+        return "reciente"
+    return None
 
 
-def orphans(groups, excluded_ports):
-    return [g for g in groups if g["state"] == "orphan" and not set(g["ports"]) & set(excluded_ports)]
+def due_for_auto(groups, max_age_hours, excluded_ports, now=None):
+    """Groups the auto-close cycle should kill."""
+    return [g for g in groups if keep_reason(g, max_age_hours, excluded_ports, now) is None]
+
+
+def orphans(groups, excluded_ports, now=None):
+    now = now or time.time()
+    return [g for g in groups if g["state"] == "orphan" and not set(g["ports"]) & set(excluded_ports)
+            and g.get("keep_until", 0) <= now]
 
 
 def kill_group(group, timeout=3.0) -> int:
