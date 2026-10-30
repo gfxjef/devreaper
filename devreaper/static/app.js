@@ -41,7 +41,12 @@ const ORIGIN = { panel: "Panel", bandeja: "Bandeja", "automático": "Ciclo autom
 const VIEWS = ["proc", "sess", "ports", "wt", "infra", "ram", "log", "settings"];
 const LIVE_S = 15 * 60;
 const LAYERS = [["dev", "dev_mb", "Desarrollo"], ["agents", "agents_mb", "Agentes"],
-  ["infra", "infra_mb", "Docker y WSL"], ["rest", "rest", "Resto del sistema"]];
+  ["infra", "infra_mb", "Docker y WSL"], ["kernel", "kernel_mb", "Kernel"], ["browsers", "browsers_mb", "Navegadores"],
+  ["rest", "rest", "Resto"]];
+const SPAWNING = 1; // processes per minute above which an idle agent "keeps launching processes"
+const KERNEL_FACT_MB = 2048;
+// "Resto" is what no band explains. Kernel and browsers are null in samples taken before they were measured.
+const withRest = (p, keys) => ({ ...p, rest: Math.max(0, p.used_mb - keys.reduce((t, k) => t + (p[k] || 0), 0)) });
 
 // ---------- state ----------
 let S = null, view = "proc", preview = false, armed = null, armTimer = null;
@@ -218,13 +223,39 @@ function renderPulse() {
   $("ram-limit").title = `Aviso al ${alert} %`;
   $("cpu").textContent = pct(S.summary.cpu);
   $("cpus").textContent = plural(sys.cpus, "núcleo", "núcleos");
+  const k = S.kernel || {}, c = $("commit");
+  c.hidden = k.commit_pct == null;
+  if (k.commit_pct != null) {
+    c.className = "commit-now " + (k.commit_level === "ok" ? "" : k.commit_level);
+    c.innerHTML = `Comprometida <b>${Math.round(k.commit_pct)} %</b> · ${mb(k.commit_mb)} de ${mb(k.commit_limit_mb)}`;
+  }
+  renderKernelBanner();
   renderLive();
+}
+
+function leakEta(k) {
+  if (!k.eta_hours) return "";
+  const when = new Date(Date.now() + k.eta_hours * 3600e3);
+  return when.toLocaleString("es-PE", { weekday: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+}
+
+function renderKernelBanner() {
+  const k = S.kernel || {}, b = $("kernel-banner");
+  const snoozed = S.settings.kernel_snooze_until > Date.now() / 1000;
+  b.hidden = k.level !== "warn" || snoozed;
+  if (b.hidden) return;
+  const eta = leakEta(k);
+  paint("kernel-banner", `<span class="k-ico">${WARN}</span>
+    <span>Windows retiene <b>${mb(k.leak_mb)}</b> en el kernel y solo los devuelve al reiniciar: cerrar programas no ayuda.
+      ${k.growth_mb_day > 0 ? `Crece ${mb(k.growth_mb_day)} al día${eta ? `; a este ritmo llegas al 90 % el ${esc(eta)}` : ""}.` : ""}</span>
+    <button class="btn" type="button" data-view-go="ram">Ver detalle</button>
+    <button class="btn ghost" type="button" data-snooze="7">No avisar en 7 días</button>`);
 }
 
 function renderLive() {
   const box = $("live");
   if (!S || !box) return;
-  const pts = live.points.map((p) => ({ ...p, rest: Math.max(0, p.used_mb - p.dev_mb - p.agents_mb - p.infra_mb) }));
+  const pts = live.points.map((p) => withRest(p, ["dev_mb", "agents_mb", "infra_mb", "kernel_mb", "browsers_mb"]));
   const cur = pts[pts.length - 1];
   $("live-legend").innerHTML = [...LAYERS].map(([cls, key, name]) =>
     `<span><i class="sw ${cls}"></i>${name} <b>${cur ? mb(cur[key]) : "—"}</b></span>`).join("") +
@@ -247,7 +278,7 @@ function renderLive() {
   if (pts.length > 1) {
     let base = pts.map(() => 0);
     for (const [cls, key] of LAYERS) {
-      const top = pts.map((p, i) => base[i] + p[key]);
+      const top = pts.map((p, i) => base[i] + (p[key] || 0));
       areas += `<path class="area a-${cls}" d="M${pts.map((p, i) => `${x(p.ts).toFixed(1)},${y(top[i]).toFixed(1)}`).join("L")}L${pts.map((p, i) => `${x(p.ts).toFixed(1)},${y(base[i]).toFixed(1)}`).reverse().join("L")}Z"/>`;
       base = top;
     }
@@ -288,6 +319,7 @@ function renderFacts() {
     ["proc", mb(sum.dev_mb), `${plural(S.groups.length, "grupo", "grupos")} de desarrollo`, false],
     ["sess", mb(sum.sessions_mb), `${plural(S.sessions.length, "agente", "agentes")}, ${sum.agents_active} ${sum.agents_active === 1 ? "activo" : "activos"}`, false],
     ["infra", I.vm_running || I.docker_running ? mb(sum.infra_mb) : "Apagado", "Docker y WSL", false],
+    ...(sum.leak_mb >= KERNEL_FACT_MB ? [["ram", mb(sum.leak_mb), "kernel retenido · se libera al reiniciar", sum.kernel_level === "warn"]] : []),
     ["orphans", String(sum.orphans), sum.orphans ? `huérfanos · ${mb(sum.orphans_mb)}` : "huérfanos", sum.orphans > 0],
     ["preview", S.settings.auto_enabled ? nextAutoText() : "Desactivado",
       S.settings.auto_enabled ? `próximo ciclo: ${sum.due} por cerrar${sum.due ? " · " + mb(sum.due_mb) : ""}` : "cierre automático", false],
@@ -322,9 +354,14 @@ function renderToolbar() {
   if (view === "sess") {
     const idle = S.sessions.filter((s) => s.closable && s.state === "inactive" && s.idle_hours != null && s.idle_hours >= 24);
     const freed = idle.reduce((t, s) => t + s.total_mb, 0);
+    const spawners = S.sessions.filter((s) => s.closable && spawningIdle(s));
     $("bulk").innerHTML = confirmBtn({ act: "kill-idle-agents", arg: { hours: 24 }, key: "idle-agents", small: false,
       label: `Cerrar agentes sin uso en más de 24 h (${idle.length})`, ask: `¿Cerrar ${idle.length} y liberar hasta ${mb(freed)}?`,
-      disabled: !idle.length, title: "Solo agentes de terminal. Sus procesos con puerto protegido siguen abiertos. Las sesiones de Claude Code se retoman con --resume." });
+      disabled: !idle.length, title: "Solo agentes de terminal. Sus procesos con puerto protegido siguen abiertos. Las sesiones de Claude Code se retoman con --resume." }) +
+      (spawners.length ? confirmBtn({ act: "kill-agents", arg: { pids: spawners.map((s) => s.pid) }, key: "spawners", small: false,
+        label: `Cerrar inactivos que lanzan procesos (${spawners.length})`,
+        ask: `¿Cerrar ${spawners.length}? Dejan de lanzar ${Math.round(spawners.reduce((t, s) => t + s.spawn_rate, 0))} por minuto`,
+        title: "Agentes de terminal sin uso que siguen lanzando procesos (git…). Cada proceso que se crea puede dejar memoria retenida en el kernel." }) : "");
   }
   if (procView) {
     const base = baseGroups(), count = (st) => st === "all" ? base.length : base.filter((g) => g.state === st).length;
@@ -434,6 +471,8 @@ function renderProc() {
   $("sel-all").indeterminate = !all && list.some((g) => sel.has(g.id));
 }
 
+const spawningIdle = (s) => s.state === "inactive" && (s.spawn_rate || 0) >= SPAWNING;
+
 let sessOrder = [];
 function renderSess() {
   const list = S.sessions.filter((s) => matches(`${s.agent} ${s.name} ${s.cwd} ${s.groups.map((g) => g.label).join(" ")}`));
@@ -446,7 +485,8 @@ function renderSess() {
     return `<tr data-row="a" data-pid="${s.pid}" data-i="${i}" class="${isSel ? "sel" : ""}" tabindex="-1">
       <td>${STATE_DOT(s.state)}</td>
       <td><div class="label">${esc(s.agent)} · ${esc(s.name)}</div><div class="sub" title="${esc(s.cwd)}">${esc(KIND_NAMES[s.kind] || "")} · ${esc(shortPath(s.cwd))}</div></td>
-      <td><div>${agentIdle(s)}</div><div class="sub">Abierto hace ${dur(s.age_hours)} · CPU ${pct(s.cpu)}</div></td>
+      <td><div>${agentIdle(s)}</div><div class="sub">Abierto hace ${dur(s.age_hours)} · CPU ${pct(s.cpu)}</div>
+        ${(s.spawn_rate || 0) >= SPAWNING ? `<div class="sub ${spawningIdle(s) ? "spawning" : ""}" title="Medido en ráfagas de 10 s cada 5 min: es un mínimo">Lanza ${Math.round(s.spawn_rate)} procesos/min${spawningIdle(s) ? " sin que nadie lo use" : ""}</div>` : ""}</td>
       <td class="r"><b class="num">${mb(s.total_mb)}</b><div class="sub">${esc(s.agent)} ${mb(s.mb)}${n ? ` + procesos ${mb(s.groups_mb)}` : ""}</div>
         <div class="stack" title="Agente / procesos que lanzó"><i class="s1" style="width:${share}%"></i>${n ? `<i class="s2" style="width:${100 - share}%"></i>` : ""}</div></td>
       <td>${n ? `<div class="chiplist">${chips}</div>` : '<span class="sub">Ninguno</span>'}
@@ -551,7 +591,7 @@ function renderInfra() {
   const prot = I.containers.filter((c) => c.protected).map((c) => c.name);
   paint("wsl-card", I.vm_running
     ? `<div class="grow"><h3>WSL · ${mb(I.vm_mb)}</h3>
-        <p>Máquina virtual de Linux${I.distros.length ? ` con ${esc(I.distros.join(", "))}` : ""}. Apagarla libera esa RAM,
+        <p>Máquina virtual de Linux${I.distros.length ? ` (distribuciones instaladas: ${esc(I.distros.join(", "))})` : ""}. Apagarla libera esa RAM,
         pero detiene también Docker Desktop y todos sus contenedores.${prot.length ? ` No se puede ahora: ${esc(prot.join(", "))} usa un puerto protegido.` : ""}</p></div>
        ${confirmBtn({ act: "wsl-shutdown", key: "wsl", label: "Apagar WSL", ask: "¿Apagar WSL y Docker?", disabled: prot.length > 0, small: false,
           title: prot.length ? "Hay contenedores con puertos protegidos" : "" })}`
@@ -559,7 +599,7 @@ function renderInfra() {
   paint("docker-card", I.docker_running
     ? `<div class="grow"><h3>Docker Desktop · ${mb(I.docker_host_mb)}</h3>
         <p>RAM de los procesos de Docker Desktop en Windows. Los contenedores corren dentro de WSL y su RAM está incluida en la de WSL.</p></div>`
-    : `<div class="grow"><h3>Docker Desktop</h3><p>${I.docker_cli ? "No está corriendo." : "No está instalado o no está en el PATH."}</p></div>`);
+    : `<div class="grow"><h3>Docker Desktop</h3><p>${I.docker_cli ? "No está corriendo." : "No está instalado."}</p></div>`);
   paint("containers", I.containers.filter((c) => matches(`${c.name} ${c.image} ${c.compose_project}`)).map((c) => `<tr>
       <td><div class="label">${esc(c.name)}</div><div class="sub">${esc(c.image)}</div></td>
       <td class="hide-md"><div class="sub" title="${esc(c.workdir)}">${esc(c.worktree ? shortPath(c.worktree) : c.compose_project || "—")}</div></td>
@@ -704,19 +744,74 @@ function setFocus(f, scroll) {
 
 // ---------- RAM 7 days ----------
 const HIST_LAYERS = [["dev", "dev_mb", "Procesos de desarrollo"], ["agents", "claude_mb", "Agentes"],
-  ["infra", "infra_mb", "Docker y WSL"], ["rest", "rest", "Resto del sistema"]];
+  ["infra", "infra_mb", "Docker y WSL"], ["kernel", "kernel_mb", "Kernel"], ["browsers", "browsers_mb", "Navegadores"],
+  ["rest", "rest", "Resto del sistema"]];
 
 async function loadRam() {
   try {
     const r = await fetch(`/api/ram?hours=${ram.hours}`, { cache: "no-store" });
-    ram.series = (await r.json()).series.map((p) => ({ ...p, rest: Math.max(0, p.used_mb - p.dev_mb - p.claude_mb - p.infra_mb) }));
+    ram.series = (await r.json()).series.map((p) => withRest(p, ["dev_mb", "claude_mb", "infra_mb", "kernel_mb", "browsers_mb"]));
     ram.fetched = Date.now();
     renderRam();
   } catch { /* offline note covers it */ }
 }
 
+function leakSpark(series) {
+  if (series.length < 2) return '<p class="sub">Juntando datos: la tendencia aparece tras unos minutos.</p>';
+  const W = 320, H = 48, t0 = series[0][0], t1 = series[series.length - 1][0];
+  const lo = Math.min(...series.map((p) => p[1])), hi = Math.max(...series.map((p) => p[1]));
+  const span = Math.max(hi - lo, 64), x = (t) => (t - t0) / Math.max(t1 - t0, 1) * W, y = (v) => H - 4 - (v - lo) / span * (H - 14);
+  const d = series.map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
+  return `<svg class="leak-spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Memoria retenida por el kernel, de ${mb(series[0][1])} a ${mb(series[series.length - 1][1])}">
+    <path class="f" d="${d}L${W},${H}L0,${H}Z"/><path class="l" d="${d}"/></svg>`;
+}
+
+function renderBootCard() {
+  const k = S.kernel || {};
+  if (k.leak_mb == null && k.commit_pct == null) {
+    paint("boot-card", '<h3>Desde el último reinicio</h3><p class="sub">Midiendo la memoria del kernel…</p>'); return;
+  }
+  const eta = leakEta(k), tokens = k.tokens != null ? k.tokens.toLocaleString("es-PE") : "—";
+  const leakCls = k.level === "warn" ? "bad" : k.level === "info" ? "warn" : "";
+  paint("boot-card", `<h3>Desde el último reinicio <span class="tag">encendido hace ${dur(k.uptime_hours)}</span></h3>
+    <div class="kv">
+      <div><b class="${leakCls}">${k.leak_mb != null ? mb(k.leak_mb) : "—"}</b><span>retenidos en el kernel</span></div>
+      <div><b>${k.growth_mb_day != null ? (k.growth_mb_day > 0 ? "+" : "") + mb(Math.abs(k.growth_mb_day)) : "—"}</b><span>por día (últimas 6 h)</span></div>
+      <div><b class="${k.commit_level === "ok" ? "" : k.commit_level === "crit" ? "bad" : "warn"}">${k.commit_pct != null ? Math.round(k.commit_pct) + " %" : "—"}</b><span>memoria comprometida</span></div>
+      <div><b>${eta || "—"}</b><span>llegas al 90 % (a este ritmo)</span></div>
+    </div>
+    ${leakSpark(k.series || [])}
+    <p class="help">${k.level === "ok"
+      ? `Normal: ${tokens} tokens de seguridad en el kernel.`
+      : `${tokens} tokens de seguridad que Windows no libera (lo normal son decenas de miles). Cada programa que se inicia deja uno o dos;
+         suele causarlo un driver de seguridad (antivirus o EDR) que vigila la creación de procesos. Solo se recupera reiniciando,
+         y lanzar menos procesos lo frena: mira abajo quién lanza más.`}</p>
+    ${k.level === "warn" ? `<button class="btn ghost small" type="button" data-snooze="7">No avisar de esto en 7 días</button>` : ""}`);
+}
+
+function renderSpawnCard() {
+  const sp = S.spawns || {}, k = S.kernel || {};
+  if (!sp.at) {
+    paint("spawn-card", '<h3>Quién lanza procesos</h3><p class="sub">La primera medición llega a los 5 minutos de abrir DevReaper.</p>'); return;
+  }
+  const max = Math.max(...(sp.launchers || []).map((l) => l.rate), 1);
+  const rows = (sp.launchers || []).slice(0, 6).map((l) => `<tr>
+      <td><div class="label">${esc(l.label)}</div><div class="sub">${l.children.map((c) => `${esc(c.name)} ${Math.round(c.rate)}`).join(" · ")}</div>
+        <div class="bar" style="width:${(l.rate / max * 100).toFixed(1)}%"></div></td>
+      <td class="r"><b class="num">${Math.round(l.rate)}</b><div class="sub">/min</div></td>
+      <td class="r">${l.agent_pid ? `<button class="btn small ghost" type="button" data-agent="${l.agent_pid}">Ver agente</button>` : ""}</td>
+    </tr>`).join("");
+  const unseen = k.implied_spawns_min && k.implied_spawns_min > Math.max(sp.rate * 2, 10)
+    ? `<p class="help">El kernel crece como si se lanzaran unos ${Math.round(k.implied_spawns_min)} procesos por minuto: muchos viven tan poco que no alcanzo a verlos.</p>` : "";
+  paint("spawn-card", `<h3>Quién lanza procesos <span class="tag">al menos ${Math.round(sp.rate)} por minuto · medido hace ${dur((Date.now() / 1000 - sp.at) / 3600)}</span></h3>
+    ${rows ? `<table class="launchers"><tbody>${rows}</tbody></table>` : '<p class="sub">Nadie lanzó procesos durante la última medición.</p>'}
+    ${unseen}
+    <p class="help">Medido en ráfagas de 10 s cada 5 minutos, sin lanzar nada: los procesos de menos de una décima de segundo no se ven, así que es un mínimo.</p>`);
+}
+
 function renderRam() {
   for (const b of document.querySelectorAll("[data-hours]")) if (!b.dataset.keep) b.setAttribute("aria-pressed", +b.dataset.hours === ram.hours);
+  if (S) { renderBootCard(); renderSpawnCard(); }
   $("ram-legend").innerHTML = HIST_LAYERS.map(([cls, , name]) => `<span><i class="sw ${cls}"></i>${name}</span>`).join("");
   const box = $("ram-chart"), series = ram.series;
   if (!S || !series) { box.innerHTML = '<p class="empty">Cargando…</p>'; return; }
@@ -744,7 +839,7 @@ function renderRam() {
     const pts = seg.length === 1 ? [{ ...seg[0], ts: seg[0].ts - bucket / 2 }, { ...seg[0], ts: seg[0].ts + bucket / 2 }] : seg;
     let base = pts.map(() => 0);
     for (const [cls, key] of HIST_LAYERS) {
-      const top = pts.map((p, i) => base[i] + p[key]);
+      const top = pts.map((p, i) => base[i] + (p[key] || 0));
       areas += `<path class="area a-${cls}" d="M${pts.map((p, i) => `${x(p.ts).toFixed(1)},${y(top[i]).toFixed(1)}`).join("L")}L${pts.map((p, i) => `${x(p.ts).toFixed(1)},${y(base[i]).toFixed(1)}`).reverse().join("L")}Z"/>`;
       base = top;
     }
@@ -771,7 +866,7 @@ function renderRam() {
     <rect x="${mg.l}" y="${mg.t}" width="${iw}" height="${ih}" fill="transparent"/></svg>`;
   hover(box.querySelector("svg"), $("ram-tip"), $("ram-x"), series, x, W, mg, iw, t0, span, (best) =>
     `<b>${new Date(best.ts * 1000).toLocaleString("es-PE", { weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })} · ${mb(best.used_mb)} usados</b>` +
-    [...HIST_LAYERS].reverse().map(([cls, key, name]) => `<div class="row"><span><i class="sw ${cls}"></i>${name}</span><span class="num">${mb(best[key])}</span></div>`).join("") +
+    [...HIST_LAYERS].reverse().filter(([, key]) => best[key] != null).map(([cls, key, name]) => `<div class="row"><span><i class="sw ${cls}"></i>${name}</span><span class="num">${mb(best[key])}</span></div>`).join("") +
     (best.top.length ? `<div class="top">Lo más pesado: ${best.top.map((i) => `${esc(i.label)} (${mb(i.mb)})`).join(", ")}</div>` : ""), gap);
   // table view: hourly (24 h) or 6-hourly (7 days) averages
   const tspan = ram.hours <= 24 ? 3600 : 6 * 3600, rows = new Map();
@@ -780,12 +875,16 @@ function renderRam() {
     if (!rows.has(k)) rows.set(k, []);
     rows.get(k).push(p);
   }
-  const avg = (arr, key) => arr.reduce((t, p) => t + p[key], 0) / arr.length;
+  const avg = (arr, key) => {
+    const vals = arr.map((p) => p[key]).filter((v) => v != null);
+    return vals.length ? vals.reduce((t, v) => t + v, 0) / vals.length : null;
+  };
   $("ram-table").innerHTML = [...rows.entries()].reverse().map(([k, arr]) => {
     const heavy = arr.reduce((a, b) => (b.used_mb > a.used_mb ? b : a));
     return `<tr><td class="num">${new Date(k * 1000).toLocaleString("es-PE", { weekday: "short", hour: "2-digit", minute: "2-digit" })}</td>
       <td class="r num">${mb(avg(arr, "dev_mb"))}</td><td class="r num">${mb(avg(arr, "claude_mb"))}</td>
-      <td class="r num">${mb(avg(arr, "infra_mb"))}</td><td class="r num">${mb(avg(arr, "rest"))}</td>
+      <td class="r num">${mb(avg(arr, "infra_mb"))}</td><td class="r num">${mb(avg(arr, "kernel_mb"))}</td>
+      <td class="r num">${mb(avg(arr, "browsers_mb"))}</td><td class="r num">${mb(avg(arr, "rest"))}</td>
       <td class="r num">${mb(avg(arr, "used_mb"))}</td>
       <td>${heavy.top[0] ? `${esc(heavy.top[0].label)} (${mb(heavy.top[0].mb)})` : "—"}</td></tr>`;
   }).join("");
@@ -799,6 +898,7 @@ async function poll() {
     pushLive();
     render();
     if (view === "ram" && Date.now() - ram.fetched > 60000) loadRam();
+    else if (view === "ram") { renderBootCard(); renderSpawnCard(); }
   } catch { $("offline").hidden = false; }
 }
 let pollTimer;
@@ -885,6 +985,12 @@ document.addEventListener("click", (e) => {
     if (k === "proc") { stateFilter = "all"; preview = false; }
     return setView(k);
   }
+  const vgo = t.closest("[data-view-go]");
+  if (vgo) return setView(vgo.dataset.viewGo);
+  const snooze = t.closest("[data-snooze]");
+  if (snooze) return run("kernel-snooze", { days: +snooze.dataset.snooze }, `No avisaré de la fuga en ${snooze.dataset.snooze} días`);
+  const ag = t.closest("[data-agent]");
+  if (ag) { view = "sess"; store.set("view", "sess"); painted.clear(); return setFocus({ type: "agent", pid: +ag.dataset.agent }, true); }
   const go = t.closest("[data-goto]");
   if (go) {
     const g = groupById(go.dataset.goto);
@@ -984,9 +1090,10 @@ $("show-all").checked = store.get("show-all") === "1";
 $("group-agent").checked = store.get("group-agent") === "1";
 if (VIEWS.includes(store.get("view"))) view = store.get("view");
 function readHash() {
-  const m = /^#(g|a)=(.+)$/.exec(location.hash);
+  const m = /^#(g|a|v)=(.+)$/.exec(location.hash);
   if (!m) return;
   if (m[1] === "g") { view = "proc"; $("show-all").checked = true; focus = { type: "group", id: decodeURIComponent(m[2]) }; }
+  else if (m[1] === "v") { if (VIEWS.includes(m[2])) { view = m[2]; focus = null; } }
   else { view = "sess"; focus = { type: "agent", pid: +m[2] }; }
   history.replaceState(null, "", location.pathname);
 }

@@ -38,6 +38,7 @@
         <div class="ram-sub" id="ram-sub">&nbsp;</div>
         <div class="meter" aria-hidden="true"><i id="ram-meter"></i><b id="ram-limit"></b></div>
         <div class="cpu-now"><b id="cpu">—</b> CPU · <span id="cpus"></span></div>
+        <div class="commit-now" id="commit" title="Memoria comprometida: lo que Windows ya prometió a los programas y al kernel. Al llegar al límite empieza a negar memoria."></div>
       </div>
       <figure class="live" aria-label="RAM en uso, últimos 15 minutos">
         <div class="live-legend" id="live-legend"></div>
@@ -47,6 +48,7 @@
     </header>
 
     <div class="facts" id="facts"></div>
+    <div class="banner kernel" id="kernel-banner" hidden></div>
 
     <div class="toolbar" id="toolbar">
       <input type="search" class="filter" id="filter" placeholder="Filtrar ( / )" aria-label="Filtrar">
@@ -121,6 +123,10 @@
         </section>
 
         <section id="view-ram" class="view" hidden>
+          <div class="sys-cards">
+            <div class="card sys" id="boot-card"></div>
+            <div class="card sys" id="spawn-card"></div>
+          </div>
           <div class="viewhead">
             <p>Una muestra por minuto mientras DevReaper está abierto.</p>
             <div class="seg" role="group" aria-label="Rango">
@@ -136,7 +142,8 @@
             <summary>Ver como tabla</summary>
             <div class="table-wrap"><table class="grid">
               <thead><tr><th>Hora</th><th class="r">Desarrollo</th><th class="r">Agentes</th><th class="r">Docker y WSL</th>
-                <th class="r">Resto</th><th class="r">RAM usada</th><th>Lo más pesado</th></tr></thead>
+                <th class="r">Kernel</th><th class="r">Navegadores</th><th class="r">Resto</th><th class="r">RAM usada</th>
+                <th>Lo más pesado</th></tr></thead>
               <tbody id="ram-table"></tbody>
             </table></div>
           </details>

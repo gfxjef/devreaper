@@ -77,6 +77,47 @@ def test_icon_ring_and_tooltip():
     assert tray.level_of(summary) == "bad"  # 1.3 GB of orphans
 
 
+KERNEL = {"level": "warn", "leak_mb": 12.6 * 1024, "growth_mb_day": 1024, "eta_hours": 30, "uptime_hours": 384,
+          "commit_level": "warn", "commit_pct": 86, "commit_mb": 65 * 1024, "commit_limit_mb": 75 * 1024}
+
+
+def test_menu_kernel_leak_and_commit_lines():
+    m = tray.menu_model(state(kernel=KERNEL, live={"browsers_mb": 6800}), URL)
+    assert "Navegadores 6.6 GB" in m[1]["text"]
+    leak = find(m, "⚠ Kernel retenido 12.6 GB")
+    texts = [e["text"] for e in leak["children"] if e is not tray.SEP]
+    assert "Crece 1.0 GB al día" in texts and "Cerrar programas no lo libera: solo reiniciar" in texts
+    assert any(t.startswith("A este ritmo llegas al 90 % el ") for t in texts)
+    assert ("kernel-snooze", {"days": 7}) in [e["action"] for e in leak["children"] if e is not tray.SEP]
+    assert find(m, "Memoria comprometida 86 %")
+
+
+def test_menu_hides_small_kernel_and_ok_commit():
+    m = tray.menu_model(state(kernel={"leak_mb": 300, "commit_level": "ok"}), URL)
+    assert not any(e is not tray.SEP and e["text"].startswith(("⚠ Kernel", "Memoria comprometida")) for e in m)
+
+
+def test_idle_agent_that_keeps_launching_processes():
+    st = state()
+    st["sessions"][0]["spawn_rate"] = 42.0
+    m = tray.menu_model(st, URL)
+    agent = find(m, "Agentes (1)")["children"][0]
+    assert agent["text"].endswith("· lanza 42 proc/min")
+    bulk = find(m, "Cerrar agentes inactivos que siguen lanzando procesos (1")
+    assert bulk["action"] == ("kill-agents", {"pids": [7]})
+    st["sessions"][0]["state"] = "active"
+    assert not any(e is not tray.SEP and e["text"].startswith("Cerrar agentes inactivos")
+                   for e in tray.menu_model(st, URL))
+
+
+def test_kernel_and_commit_raise_the_icon_level():
+    calm = dict(state()["summary"], orphans=0, orphans_mb=0, due=0, dev_mb=100)
+    assert tray.level_of(calm) == "ok"
+    assert tray.level_of(dict(calm, kernel_level="warn")) == "warn"
+    assert tray.level_of(dict(calm, commit_level="crit")) == "bad"
+    assert "Kernel 12.6 GB" in tray.tooltip(dict(calm, kernel_level="warn", leak_mb=12.6 * 1024))
+
+
 def test_result_text():
     assert tray.result_text({"killed": 2, "freed_mb": 2048, "kept": 1}) == "2 cerrados · 2.0 GB liberados · 1 protegidos siguen abiertos"
     assert tray.result_text({"ok": True}) == "Listo"

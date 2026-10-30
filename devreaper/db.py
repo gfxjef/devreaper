@@ -18,6 +18,10 @@ DEFAULTS = {
     # Extra folders to search for repos. Usually empty: projects are discovered from where agents work.
     "project_roots": [],
     "ram_alert_percent": 90,
+    # notification bookkeeping (not editable from the panel)
+    "kernel_alert_at": 0,
+    "kernel_snooze_until": 0,
+    "commit_alert_at": 0,
 }
 
 SCHEMA = """
@@ -37,9 +41,12 @@ CREATE TABLE IF NOT EXISTS ram_samples (
     ts REAL PRIMARY KEY, used_mb REAL, dev_mb REAL, claude_mb REAL, infra_mb REAL, top TEXT);
 CREATE TABLE IF NOT EXISTS keep_alive (group_id TEXT PRIMARY KEY, until REAL NOT NULL, label TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS projects (path TEXT PRIMARY KEY, last_seen REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS kernel_samples (
+    ts REAL PRIMARY KEY, tokens INTEGER, leak_mb REAL, kernel_mb REAL, commit_mb REAL, commit_limit_mb REAL);
 """
 MIGRATIONS = {"kill_log": {"origin": "TEXT DEFAULT ''", "cmd": "TEXT DEFAULT ''"},
-              "lineage": {"agent": "TEXT DEFAULT ''"}}
+              "lineage": {"agent": "TEXT DEFAULT ''"},
+              "ram_samples": {"kernel_mb": "REAL", "browsers_mb": "REAL"}}
 # Runtimes added to the default watch list after release, merged once into lists users already saved.
 DEV_NAMES_V2 = ["java", "go", "dotnet", "ruby"]
 
@@ -197,21 +204,33 @@ class DB:
                                          (time.time() - days * 86400,))]
 
     # RAM samples
-    def add_sample(self, ts, used_mb, dev_mb, claude_mb, infra_mb, top):
-        self._exec("INSERT OR REPLACE INTO ram_samples VALUES (?, ?, ?, ?, ?, ?)",
-                   (ts, used_mb, dev_mb, claude_mb, infra_mb, json.dumps(top)))
+    def add_sample(self, ts, used_mb, dev_mb, claude_mb, infra_mb, top, kernel_mb=None, browsers_mb=None):
+        self._exec("INSERT OR REPLACE INTO ram_samples (ts, used_mb, dev_mb, claude_mb, infra_mb, top, kernel_mb,"
+                   " browsers_mb) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                   (ts, used_mb, dev_mb, claude_mb, infra_mb, json.dumps(top), kernel_mb, browsers_mb))
 
     def ram_series(self, hours=168, max_points=480):
         """Samples of the last `hours`, averaged into at most `max_points` buckets.
         Each bucket keeps the top consumers of its heaviest sample."""
         since = time.time() - hours * 3600
-        rows = self._exec("SELECT ts, used_mb, dev_mb, claude_mb, infra_mb, top FROM ram_samples"
-                          " WHERE ts >= ? ORDER BY ts", (since,))
+        rows = self._exec("SELECT ts, used_mb, dev_mb, claude_mb, infra_mb, top, kernel_mb, browsers_mb"
+                          " FROM ram_samples WHERE ts >= ? ORDER BY ts", (since,))
         return bucket_samples(rows, hours * 3600 / max_points)
+
+    # kernel pools and the token leak
+    def add_kernel_sample(self, ts, reading, kernel_mb):
+        self._exec("INSERT OR REPLACE INTO kernel_samples VALUES (?, ?, ?, ?, ?, ?)",
+                   (ts, reading.get("tokens"), reading.get("leak_mb"), kernel_mb, reading.get("commit_mb"),
+                    reading.get("commit_limit_mb")))
+
+    def kernel_history(self, since):
+        """[(ts, tokens, leak_mb)] since `since`, oldest first."""
+        return self._exec("SELECT ts, tokens, leak_mb FROM kernel_samples WHERE ts >= ? ORDER BY ts", (since,))
 
     def prune(self, sample_days=7, port_days=30, lineage_days=14):
         now = time.time()
         self._exec("DELETE FROM ram_samples WHERE ts < ?", (now - sample_days * 86400,))
+        self._exec("DELETE FROM kernel_samples WHERE ts < ?", (now - sample_days * 86400,))
         self._exec("DELETE FROM port_history WHERE last_seen < ?", (now - port_days * 86400,))
         self._exec("DELETE FROM keep_alive WHERE until < ?", (now,))
         self._exec("DELETE FROM projects WHERE last_seen < ?", (now - port_days * 86400,))
@@ -219,20 +238,25 @@ class DB:
 
 
 def bucket_samples(rows, bucket_s):
+    """rows: (ts, used, dev, claude, infra, top[, kernel, browsers]). Kernel and browsers are None in samples
+    taken before they were measured; a bucket reports them only if one of its samples has them."""
     buckets = {}
-    for ts, used, dev, claude, infra, top in rows:
-        buckets.setdefault(int(ts // bucket_s), []).append((ts, used, dev, claude, infra, top))
+    for row in rows:
+        buckets.setdefault(int(row[0] // bucket_s), []).append(tuple(row) + (None,) * (8 - len(row)))
     out = []
     for key in sorted(buckets):
         b = buckets[key]
         n = len(b)
         heaviest = max(b, key=lambda r: r[1])
+
+        def avg(i):
+            vals = [r[i] for r in b if r[i] is not None]
+            return round(sum(vals) / len(vals), 1) if vals else None
+
         out.append({
             "ts": round(sum(r[0] for r in b) / n),
-            "used_mb": round(sum(r[1] for r in b) / n, 1),
-            "dev_mb": round(sum(r[2] for r in b) / n, 1),
-            "claude_mb": round(sum(r[3] for r in b) / n, 1),
-            "infra_mb": round(sum(r[4] for r in b) / n, 1),
+            "used_mb": avg(1), "dev_mb": avg(2), "claude_mb": avg(3), "infra_mb": avg(4),
+            "kernel_mb": avg(6), "browsers_mb": avg(7),
             "top": json.loads(heaviest[5] or "[]"),
         })
     return out

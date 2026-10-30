@@ -8,6 +8,7 @@
   --row-hover: #F5F7FA; --row-sel: #EDF2FD; --cand: #FFF6E5;
   /* RAM series (validated: dataviz validate_palette.js, light on #fff / dark on #1c232c) */
   --s-dev: #2a78d6; --s-agents: #eb6834; --s-infra: #1baf7a; --s-rest: #CDD3DB; --grid: #E6E9ED;
+  --s-kernel: #7a4fcf; --s-browsers: #d4508f;
   --shadow: 0 8px 28px rgba(27, 36, 48, .16);
 }
 @media (prefers-color-scheme: dark) {
@@ -18,6 +19,7 @@
     --active: #4CB27A; --inactive: #D9A23A; --orphan: #E5625A; --none: #8C98A7;
     --row-hover: #222A34; --row-sel: #232D45; --cand: #2D2818;
     --s-dev: #3987e5; --s-agents: #d95926; --s-infra: #199e70; --s-rest: #3A4552; --grid: #26303B;
+    --s-kernel: #8d68e6; --s-browsers: #d65c98;
     --shadow: 0 8px 28px rgba(0, 0, 0, .45);
   }
 }
@@ -28,6 +30,7 @@
   --active: #4CB27A; --inactive: #D9A23A; --orphan: #E5625A; --none: #8C98A7;
   --row-hover: #222A34; --row-sel: #232D45; --cand: #2D2818;
   --s-dev: #3987e5; --s-agents: #d95926; --s-infra: #199e70; --s-rest: #3A4552; --grid: #26303B;
+  --s-kernel: #8d68e6; --s-browsers: #d65c98;
   --shadow: 0 8px 28px rgba(0, 0, 0, .45);
 }
 
@@ -99,7 +102,36 @@ input:focus-visible, button:focus-visible, summary:focus-visible, a:focus-visibl
 .sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
 .sw.dev { background: var(--s-dev); } .sw.agents { background: var(--s-agents); }
 .sw.infra { background: var(--s-infra); } .sw.rest { background: var(--s-rest); }
+.sw.kernel { background: var(--s-kernel); } .sw.browsers { background: var(--s-browsers); }
 .a-dev { fill: var(--s-dev); } .a-agents { fill: var(--s-agents); } .a-infra { fill: var(--s-infra); } .a-rest { fill: var(--s-rest); }
+.a-kernel { fill: var(--s-kernel); } .a-browsers { fill: var(--s-browsers); }
+.commit-now { font-size: 12px; color: var(--muted); }
+.commit-now b { color: var(--ink); font-weight: 600; }
+.commit-now.warn b { color: var(--inactive); } .commit-now.crit b { color: var(--orphan); }
+
+/* kernel leak: one banner while it matters, details in the RAM view */
+.banner.kernel { border-color: color-mix(in srgb, var(--s-kernel) 55%, var(--line));
+                 background: color-mix(in srgb, var(--s-kernel) 9%, var(--surface)); }
+.banner.kernel .k-ico { color: var(--s-kernel); display: inline-flex; flex: none; min-width: 0; }
+.banner.kernel span b { font-weight: 600; }
+.sys-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 10px; }
+.card.sys { display: block; }
+.card.sys h3 { display: flex; align-items: baseline; gap: 8px; }
+.card.sys h3 .tag { font-size: 12px; font-weight: 500; color: var(--muted); }
+.kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px 14px; margin: 10px 0; }
+.kv div { display: flex; flex-direction: column; gap: 1px; }
+.kv b { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.kv b.bad { color: var(--orphan); } .kv b.warn { color: var(--inactive); }
+.kv span { font-size: 12px; color: var(--muted); }
+.leak-spark { width: 100%; height: 48px; display: block; }
+.leak-spark path.l { fill: none; stroke: var(--s-kernel); stroke-width: 2; stroke-linejoin: round; }
+.leak-spark path.f { fill: color-mix(in srgb, var(--s-kernel) 14%, transparent); }
+.leak-spark text { font-size: 10px; fill: var(--faint); }
+.launchers { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px; }
+.launchers td { padding: 5px 4px; border-top: 1px solid var(--line-soft); vertical-align: top; }
+.launchers td.r { text-align: right; white-space: nowrap; }
+.launchers .bar { height: 4px; border-radius: 2px; background: var(--s-kernel); margin-top: 4px; min-width: 2px; }
+.spawning { color: var(--inactive); font-weight: 600; }
 .area { stroke: var(--surface); stroke-width: 1.5; stroke-linejoin: round; }
 .live .area { stroke: var(--bg); }
 .gridline { stroke: var(--grid); stroke-width: 1; }

@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import webbrowser
 
 from PIL import Image, ImageDraw
@@ -13,6 +14,8 @@ STATE_WORDS = {"active": "activa", "inactive": "inactiva", "orphan": "huérfano"
 MAX_GROUPS = 12
 MAX_AGENTS = 12
 MAX_PORTS = 12
+KERNEL_LINE_MB = 2048  # show the leak in the menu from this size on
+SPAWNING = 1.0         # processes per minute above which an idle agent is "still launching processes"
 
 
 def gb(mb):
@@ -36,9 +39,10 @@ def dur(hours):
 
 
 def level_of(summary) -> str:
-    if summary["ram_percent"] >= 90 or summary["orphans_mb"] >= 1024:
+    if summary["ram_percent"] >= 90 or summary["orphans_mb"] >= 1024 or summary.get("commit_level") == "crit":
         return "bad"
-    if summary["due"] or summary["orphans"] or summary["dev_mb"] >= 4096:
+    if (summary["due"] or summary["orphans"] or summary["dev_mb"] >= 4096
+            or summary.get("kernel_level") == "warn" or summary.get("commit_level") == "warn"):
         return "warn"
     return "ok"
 
@@ -63,6 +67,8 @@ def tooltip(summary) -> str:
     """Windows truncates tray tooltips at 127 characters."""
     text = (f"DevReaper · RAM {summary['ram_percent']:.0f} % · Dev {gb(summary['dev_mb'])} · "
             f"Agentes {gb(summary['sessions_mb'])}")
+    if summary.get("kernel_level") == "warn" and summary.get("leak_mb"):
+        text += f" · Kernel {gb(summary['leak_mb'])} (reinicia)"
     if summary["orphans"]:
         text += f" · {summary['orphans']} huérfanos"
     return text[:127]
@@ -109,14 +115,24 @@ def group_entry(g, url):
     return item(head, children=sub)
 
 
+def spawning_idle(s) -> bool:
+    """An agent nobody uses that keeps starting processes (git polling…), each one feeding the kernel leak."""
+    return s["state"] == "inactive" and (s.get("spawn_rate") or 0) >= SPAWNING
+
+
 def agent_entry(s, url):
     n = len(s["groups"])
+    rate = s.get("spawn_rate") or 0
     head = f"{s['agent']} · {s['name']} — {gb(s['total_mb'])} ({STATE_WORDS[s['state']]})"
+    if spawning_idle(s):
+        head += f" · lanza {rate:.0f} proc/min"
     sub = [item(f"{s['agent']} {gb(s['mb'])}" + (f" + {n} procesos {gb(s['groups_mb'])}" if n else " · sin procesos"),
                 enabled=False),
            item(f"Sin actividad hace {dur(s['idle_hours'])}" if s["idle_hours"] is not None
-                else "Actividad: midiendo…", enabled=False),
-           SEP]
+                else "Actividad: midiendo…", enabled=False)]
+    if rate >= SPAWNING:
+        sub.append(item(f"Lanza al menos {rate:.0f} procesos por minuto", enabled=False))
+    sub.append(SEP)
     closable = n - s["protected"]
     if closable:
         sub.append(item(f"Cerrar sus procesos ({closable} · {gb(s['groups_mb'])})", ("kill-agent-procs", {"pid": s["pid"]})))
@@ -126,6 +142,29 @@ def agent_entry(s, url):
     return item(head, children=sub)
 
 
+def kernel_entries(k, url):
+    """Menu lines for kernel memory and committed memory, only when they matter."""
+    out = []
+    leak = k.get("leak_mb")
+    if leak and leak >= KERNEL_LINE_MB:
+        sub = []
+        if k.get("growth_mb_day") and k["growth_mb_day"] > 0:
+            sub.append(item(f"Crece {gb(k['growth_mb_day'])} al día", enabled=False))
+        if k.get("eta_hours"):
+            when = time.strftime("%d/%m %H:%M", time.localtime(time.time() + k["eta_hours"] * 3600))
+            sub.append(item(f"A este ritmo llegas al 90 % el {when}", enabled=False))
+        if k.get("uptime_hours"):
+            sub.append(item(f"Encendido hace {dur(k['uptime_hours'])}", enabled=False))
+        sub += [item("Cerrar programas no lo libera: solo reiniciar", enabled=False), SEP,
+                item("No avisar de esto en 7 días", ("kernel-snooze", {"days": 7})),
+                item("Ver en el panel", ("open", f"{url}#v=ram"))]
+        out.append(item(f"⚠ Kernel retenido {gb(leak)} — solo se libera reiniciando", children=sub))
+    if k.get("commit_level") in ("warn", "crit"):
+        out.append(item(f"Memoria comprometida {k['commit_pct']:.0f} % ({gb(k['commit_mb'])} de "
+                        f"{gb(k['commit_limit_mb'])})", enabled=False))
+    return out
+
+
 def menu_model(state, url):
     """The tray menu as plain data (tested without pystray). Actions: ('open', url) or (api action, body)."""
     S, summ = state["system"], state["summary"]
@@ -133,11 +172,15 @@ def menu_model(state, url):
     agents = state["sessions"]
     ports = [r for r in state["ports"] if r["holder"] and r["dev"]]
     idle = [s for s in agents if s["closable"] and s["state"] == "inactive" and (s["idle_hours"] or 0) >= 24]
+    spawners = [s for s in agents if s["closable"] and spawning_idle(s)]
+    live = state.get("live") or {}
     model = [
         item(f"RAM {S['percent']:.0f} % · {gb(S['used_mb'])} de {gb(S['total_mb'])} · CPU {summ['cpu']:.0f} %",
              enabled=False),
-        item(f"Desarrollo {gb(summ['dev_mb'])} · Agentes {gb(summ['sessions_mb'])} · Docker/WSL {gb(summ['infra_mb'])}",
+        item(f"Desarrollo {gb(summ['dev_mb'])} · Agentes {gb(summ['sessions_mb'])} · Docker/WSL {gb(summ['infra_mb'])}"
+             + (f" · Navegadores {gb(live['browsers_mb'])}" if live.get("browsers_mb") else ""),
              enabled=False),
+        *kernel_entries(state.get("kernel") or {}, url),
         SEP,
         item(f"Procesos ({len(groups)})", children=[group_entry(g, url) for g in groups[:MAX_GROUPS]]
              + ([SEP, item(f"… y {len(groups) - MAX_GROUPS} más en el panel", ("open", url))]
@@ -158,6 +201,9 @@ def menu_model(state, url):
              enabled=bool(summ["due"])),
         item(f"Cerrar agentes sin uso en más de 24 h ({len(idle)} · {gb(sum(s['total_mb'] for s in idle))})",
              ("kill-idle-agents", {"hours": 24}), enabled=bool(idle)),
+        *([item(f"Cerrar agentes inactivos que siguen lanzando procesos ({len(spawners)} · "
+                f"{sum(s['spawn_rate'] for s in spawners):.0f} proc/min)",
+                ("kill-agents", {"pids": [s["pid"] for s in spawners]}))] if spawners else []),
         item(f"Cierre automático cada {state['settings']['auto_interval_hours']:g} h",
              ("settings", {"auto_enabled": not state["settings"]["auto_enabled"]}),
              checked=bool(state["settings"]["auto_enabled"])),

@@ -1,7 +1,10 @@
-"""Docker containers and the WSL 2 VM: what they hold (ports, RAM) and how to stop them."""
+"""Docker containers and the WSL 2 VM: what they hold (ports, RAM) and how to stop them.
+Polling never starts a process: Docker is read through its Engine API on a named pipe, WSL from the registry."""
 import json
+import os
 import re
 import shutil
+import threading
 
 import psutil
 
@@ -16,36 +19,8 @@ INFRA_NAMES = {
 }
 VM_NAMES = {"vmmem", "vmmemwsl"}
 DOCKER_HOST_NAMES = {"com.docker.backend.exe", "com.docker.build.exe", "docker desktop.exe", "docker-sandbox.exe"}
-PORT_RE = re.compile(r"(?:(\d+\.\d+\.\d+\.\d+)|\[?::\]?):(\d+)->(\d+)/(tcp|udp)")
-UNITS = {"b": 1 / 2**20, "kib": 1 / 1024, "kb": 1 / 1024, "mib": 1, "mb": 1, "gib": 1024, "gb": 1024}
-
-
-def parse_ports(text: str):
-    """'127.0.0.1:3990->3000/tcp, :::5432->5432/tcp' -> [{'host_ip', 'host_port', 'container_port'}] (deduped)."""
-    seen, out = set(), []
-    for ip, host, cport, proto in PORT_RE.findall(text or ""):
-        if proto != "tcp" or int(host) in seen:
-            continue
-        seen.add(int(host))
-        out.append({"host_ip": ip or "::", "host_port": int(host), "container_port": int(cport)})
-    return out
-
-
-def parse_mem(text: str) -> float:
-    """'364.8MiB / 15.58GiB' -> 364.8 (MB)."""
-    m = re.match(r"\s*([\d.]+)\s*([a-zA-Z]+)", text or "")
-    if not m:
-        return 0.0
-    return round(float(m.group(1)) * UNITS.get(m.group(2).lower(), 0), 1)
-
-
-def parse_labels(text: str) -> dict:
-    out = {}
-    for part in (text or "").split(","):
-        key, sep, value = part.partition("=")
-        if sep:
-            out[key] = value
-    return out
+DEFAULT_PIPE = "\\\\.\\pipe\\docker_engine"
+LXSS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Lxss"
 
 
 def host_processes():
@@ -77,44 +52,152 @@ def host_processes():
             "docker_host_mb": round(docker_mb, 1), "docker_running": docker_running}
 
 
-def docker_containers():
-    docker = shutil.which("docker")
-    if not docker:
-        return None
-    raw = quiet.run([docker, "ps", "--format", "{{json .}}"], timeout=8)
-    containers = []
-    for line in raw.splitlines():
+def docker_pipe():
+    """Named pipe of the Docker Engine API: DOCKER_HOST=npipe://… if set, else Docker Desktop's default."""
+    host = os.environ.get("DOCKER_HOST", "")
+    if host.startswith("npipe://"):
+        return host.removeprefix("npipe://").replace("/", "\\")
+    return DEFAULT_PIPE
+
+
+def decode_chunked(body: bytes) -> bytes:
+    out, rest = [], body
+    while rest:
+        size_line, _, rest = rest.partition(b"\r\n")
         try:
-            c = json.loads(line)
+            n = int(size_line.split(b";")[0].strip() or b"0", 16)
         except ValueError:
+            break
+        if n == 0:
+            break
+        out.append(rest[:n])
+        rest = rest[n + 2:]
+    return b"".join(out)
+
+
+def parse_http(raw: bytes):
+    """(status, body) of a raw HTTP/1.1 response."""
+    head, _, body = raw.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    try:
+        status = int(lines[0].split()[1])
+    except (IndexError, ValueError):
+        return 0, b""
+    headers = {k.strip().lower(): v.strip() for k, _, v in (l.partition(b":") for l in lines[1:])}
+    if b"chunked" in headers.get(b"transfer-encoding", b"").lower():
+        body = decode_chunked(body)
+    return status, body
+
+
+def _pipe_request(pipe, method, path):
+    with open(pipe, "r+b", buffering=0) as f:
+        f.write(f"{method} {path} HTTP/1.1\r\nHost: docker\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode())
+        chunks = []
+        while True:
+            try:
+                data = f.read(65536)
+            except OSError:  # the engine closed its end: that is the end of the response
+                break
+            if not data:
+                break
+            chunks.append(data)
+    return parse_http(b"".join(chunks))
+
+
+_api_busy = threading.Lock()
+
+
+def docker_api(method, path, timeout=10.0):
+    """(status, body) from the Docker Engine over its named pipe, or None if it is unreachable or hung.
+    A hung request is abandoned in its thread and no new one starts until it returns."""
+    pipe = docker_pipe()
+    if not os.path.exists(pipe) or not _api_busy.acquire(blocking=False):
+        return None
+    result = {}
+
+    def call():
+        try:
+            result["r"] = _pipe_request(pipe, method, path)
+        except OSError:
+            result["r"] = None
+        finally:
+            _api_busy.release()
+
+    t = threading.Thread(target=call, daemon=True)
+    t.start()
+    t.join(timeout)
+    return result.get("r")
+
+
+def api_ports(ports):
+    """Engine API port list -> [{'host_ip', 'host_port', 'container_port'}] (published TCP only, deduped)."""
+    seen, out = set(), []
+    for p in ports or []:
+        host = p.get("PublicPort")
+        if not host or p.get("Type") != "tcp" or host in seen:
             continue
-        labels = parse_labels(c.get("Labels", ""))
+        seen.add(host)
+        out.append({"host_ip": p.get("IP") or "::", "host_port": int(host), "container_port": int(p.get("PrivatePort") or 0)})
+    return out
+
+
+def stats_mb(stats) -> float:
+    """Memory as `docker stats` shows it: usage minus inactive page cache."""
+    mem = (stats or {}).get("memory_stats") or {}
+    usage = mem.get("usage") or 0
+    extra = mem.get("stats") or {}
+    cache = extra.get("inactive_file", extra.get("total_inactive_file", 0)) or 0
+    return round(max(usage - cache, 0) / 2**20, 1)
+
+
+def docker_containers():
+    r = docker_api("GET", "/containers/json")
+    if r is None or r[0] != 200:
+        return None
+    try:
+        listed = json.loads(r[1])
+    except ValueError:
+        return None
+    containers = []
+    for c in listed:
+        labels = c.get("Labels") or {}
         workdir = labels.get("com.docker.compose.project.working_dir", "")
         containers.append({
-            "id": c.get("ID", ""), "name": c.get("Names", ""), "image": c.get("Image", ""),
-            "status": c.get("Status", ""), "running_for": c.get("RunningFor", ""),
-            "ports": parse_ports(c.get("Ports", "")),
+            "id": (c.get("Id") or "")[:12], "name": ((c.get("Names") or ["/"])[0]).lstrip("/"),
+            "image": c.get("Image", ""), "status": c.get("Status", ""), "running_for": "",
+            "ports": api_ports(c.get("Ports")),
             "compose_project": labels.get("com.docker.compose.project", ""),
             "workdir": workdir, "worktree": worktrees.worktree_of(workdir),
             "mb": 0.0,
         })
-    if containers:
-        stats = quiet.run([docker, "stats", "--no-stream", "--format", "{{json .}}"], timeout=15)
-        mem = {}
-        for line in stats.splitlines():
+    for c in containers:
+        s = docker_api("GET", f"/containers/{c['id']}/stats?stream=false&one-shot=true")
+        if s and s[0] == 200:
             try:
-                s = json.loads(line)
+                c["mb"] = stats_mb(json.loads(s[1]))
             except ValueError:
-                continue
-            mem[s.get("ID", "")[:12]] = parse_mem(s.get("MemUsage", ""))
-        for c in containers:
-            c["mb"] = mem.get(c["id"][:12], 0.0)
+                pass
     return containers
 
 
 def wsl_distros():
-    raw = quiet.run(["wsl", "--list", "--running", "--quiet"], timeout=8)
-    return [line.strip() for line in raw.splitlines() if line.strip()]
+    """Installed WSL distributions, from the registry (`wsl --list` would start a process every call)."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    out = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, LXSS_KEY) as root:
+            for i in range(winreg.QueryInfoKey(root)[0]):
+                try:
+                    with winreg.OpenKey(root, winreg.EnumKey(root, i)) as k:
+                        out.append(winreg.QueryValueEx(k, "DistributionName")[0])
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    return sorted(out, key=str.lower)
 
 
 def snapshot():
@@ -123,7 +206,7 @@ def snapshot():
     return {
         **host,
         "containers": containers or [],
-        "docker_cli": shutil.which("docker") is not None,
+        "docker_cli": os.path.exists(docker_pipe()) or shutil.which("docker") is not None,
         "distros": wsl_distros() if host["vm_running"] else [],
     }
 
@@ -131,9 +214,12 @@ def snapshot():
 def docker_stop(container_id: str):
     if not re.fullmatch(r"[0-9a-f]{6,64}", container_id or ""):
         raise ValueError("id de contenedor inválido")
-    docker = shutil.which("docker")
+    r = docker_api("POST", f"/containers/{container_id}/stop?t=10", timeout=30)
+    if r is not None and r[0] in (204, 304):
+        return
+    docker = shutil.which("docker")  # engine API unreachable: fall back to the CLI (a user action, not a poll)
     if not docker:
-        raise ValueError("no encontré docker en el PATH")
+        raise ValueError("no pude hablar con Docker")
     if not quiet.run([docker, "stop", container_id], timeout=60):
         raise ValueError(f"docker no pudo detener {container_id}")
 

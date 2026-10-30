@@ -125,3 +125,17 @@ panel en tiempo real que use toda la ventana y con mejores opciones de cierre.
 | Bandeja (`tray.py`) | Ícono = anillo de RAM con el color del nivel. Menú reconstruido en el hilo de UI justo antes de mostrarse (subclase de `pystray.Icon`): procesos, agentes y puertos con submenús y acciones. Las acciones corren en otro hilo y avisan con una notificación |
 | Panel | Ventana Edge `--app`. Rejilla a pantalla completa: rail, cabecera con RAM en vivo (ring buffer de 15 min en el servidor, `/api/live`), lista con scroll propio y encabezado fijo, inspector con RAM/CPU del grupo. Inspector flotante < 1500 px, rail de íconos < 1280 px, una columna < 720 px |
 | Robustez | `process_iter` comparte objetos `Process` entre hilos: se leen atributos con llamadas directas/`as_dict`, no `p.info`. El servidor lee el cuerpo antes de responder 403 (evita resets en Windows) |
+
+## Ampliación 2026-10-30: memoria del kernel y cero procesos al vigilar
+
+Diagnóstico hecho junto con la sesión `analisis_ram`: en esta PC el "Resto del sistema" eran ~12 GB de pool del kernel (tokens de seguridad que un driver de seguridad no libera; ~1,5 por proceso creado, ~1 GB/día). Ningún proceso es dueño de esa memoria; solo se libera reiniciando.
+
+| Pieza | Decisión |
+|---|---|
+| Lecturas (`winapi.py`) | ctypes, sin admin y sin procesos: `GetPerformanceInfo` (commit, pools), PDH `\Memory\Pool Paged Resident Bytes`, `NtQuerySystemInformation(22)` (pool tags, contadores ULONG con `& 0xFFFFFFFF`), Toolhelp para la tabla de procesos |
+| Fuga (`kernel.py`) | Fuga = tags `Toke`+`SeAt`+`SeTd`+`SeDt`+`SeTl`. Muestra cada 60 s en `kernel_samples` (7 días); tendencia por regresión sobre 6 h. Info: > 300k tokens o > 100k/día. Aviso: > 3 GB o ETA al 90 % de RAM o commit < 72 h (con crecimiento ≥ 200 MB/día). Commit: 85 % aviso, 95 % crítico |
+| Gráfica | Bandas nuevas Kernel (pool residente, nunca el tamaño virtual) y Navegadores (Chrome, Edge, Firefox… fuera de los grupos de desarrollo). Colores validados con simulación de daltonismo (ΔE OKLab adyacente ≥ 8 en claro y oscuro) |
+| Avisos | Fuga: 1 vez al día, silenciable 7 días (`kernel_snooze_until`). Commit: 24 h (aviso) / 3 h (crítico). El aviso de RAM nombra primero al kernel cuando es la causa |
+| Quién lanza procesos (`spawns.py`) | Ráfaga de 10 s cada 5 min con una foto Toolhelp cada 100 ms; cada PID nuevo se atribuye al agente entre sus ancestros o al programa padre. Es un mínimo (se pierden procesos < 0,1 s); se contrasta con la tasa implícita por tokens |
+| Agentes que lanzan procesos | `spawn_rate` por agente; "inactivo que sigue lanzando procesos" si está inactivo y lanza ≥ 1/min. Acción `kill-agents` (solo terminal, revalida inactividad) |
+| Cero procesos al vigilar | Docker por su Engine API (named pipe), WSL desde el registro, repos leídos de `.git` (refs, packed-refs, worktrees, upstream). `git branch --merged` solo si se movió una punta; fecha de commit con un `git show -s` por repo, una vez por SHA |

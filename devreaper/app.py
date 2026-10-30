@@ -7,7 +7,7 @@ from collections import deque
 
 import psutil
 
-from . import agents, infra, projects, reaper, scanner, sessions, startup, worktrees
+from . import agents, infra, kernel, projects, reaper, scanner, sessions, spawns, startup, winapi, worktrees
 
 log = logging.getLogger("devreaper")
 
@@ -21,6 +21,11 @@ PRUNE_EVERY_S = 3600
 ALERT_COOLDOWN_S = 1800
 PORT_TOUCH_EVERY_S = 60
 LIVE_POINTS = 450  # 15 minutes of live data at one point per scan
+SPAWN_EVERY_S = 300
+SPAWN_BURST_S = 10
+KERNEL_ALERT_EVERY_S = 86400
+COMMIT_ALERT_EVERY_S = {"warn": 86400, "crit": 3 * 3600}
+TOKENS_PER_PROCESS = 1.5  # tokens a leaking driver keeps per process started (measured on an affected machine)
 EMPTY_INFRA = {"vm_mb": 0.0, "vm_running": False, "docker_host_mb": 0.0, "docker_running": False,
                "containers": [], "docker_cli": False, "distros": [], "updated": 0}
 
@@ -40,6 +45,11 @@ class App:
         self._live = deque(maxlen=LIVE_POINTS)
         self._group_live = {}
         self._history = {"dirs": [], "at": 0.0}
+        self._extras = {"browsers_mb": 0.0, "member_of": {}, "own": frozenset()}
+        self._pool = winapi.ResidentPagedPool()
+        self._kernel = None
+        self._kernel_series = []
+        self._spawns = spawns.attribute(None, {}, {})
         self._stop = threading.Event()
         self.on_scan = None  # callback(summary) for the tray icon
         psutil.cpu_percent(None)  # prime the system CPU counter
@@ -51,13 +61,15 @@ class App:
     def rescan(self):
         settings = self.db.settings()
         found = sessions.load_sessions(settings["inactive_after_hours"])
+        extras = {}
         groups, listeners, agent_map = scanner.scan(settings, found, self.db, self.db.excluded_ports(),
-                                                    activity=self._activity)
+                                                    activity=self._activity, extras=extras)
         keep = self.db.kept_alive()
         for g in groups:
             g["keep_until"] = keep.get(g["id"], 0)
         with self._lock:
             self._groups, self._listeners, self._sessions = groups, listeners, agent_map
+            self._extras = extras or self._extras
             self._scanned_at = time.time()
         self._record_live(groups, agent_map)
         self._record_ports(groups)
@@ -81,13 +93,18 @@ class App:
         now = time.time()
         vm = psutil.virtual_memory()
         with self._lock:
-            inf = self._infra
+            inf, extras = self._infra, self._extras
+        perf = winapi.perf_info() or {}
         self._live.append({
             "ts": round(now, 1),
             "used_mb": round((vm.total - vm.available) / 2**20, 1),
             "dev_mb": round(sum(g["mb"] for g in groups), 1),
             "agents_mb": round(sum(a["mb"] for a in agent_map.values()), 1),
             "infra_mb": round(inf["vm_mb"] + inf["docker_host_mb"], 1),
+            "kernel_mb": kernel.resident_mb({"paged_resident_mb": self._pool.read_mb(),
+                                             "nonpaged_mb": perf.get("nonpaged_mb")}),
+            "browsers_mb": extras.get("browsers_mb", 0.0),
+            "commit_mb": perf.get("commit_mb"), "commit_limit_mb": perf.get("commit_limit_mb"),
             "cpu": psutil.cpu_percent(None),
         })
         alive = set()
@@ -154,8 +171,47 @@ class App:
         s = self.summary()
         top = [{"label": i["label"], "kind": i["kind"], "mb": i["mb"]}
                for i in self.consumers() if i["kind"] != "WSL"][:3]
+        last = self._live[-1] if self._live else {}
         self.db.add_sample(time.time(), round((vm.total - vm.available) / 2**20, 1), s["dev_mb"],
-                           s["sessions_mb"], s["infra_mb"], top)
+                           s["sessions_mb"], s["infra_mb"], top, last.get("kernel_mb"), last.get("browsers_mb"))
+
+    def refresh_kernel(self, now=None):
+        """Read the pools and leak tags, store the sample, and re-assess the leak from the last 6 h."""
+        now = time.time() if now is None else now
+        reading = kernel.read(self._pool)
+        if reading.get("tokens") is not None or reading.get("commit_mb") is not None:
+            self.db.add_kernel_sample(now, reading, kernel.resident_mb(reading))
+        vm = psutil.virtual_memory()
+        week = self.db.kernel_history(now - 7 * 86400)
+        recent = [r for r in week if r[0] >= now - kernel.TREND_HOURS * 3600]
+        verdict = kernel.assess(reading, recent, vm.total / 2**20, (vm.total - vm.available) / 2**20,
+                                psutil.boot_time(), now)
+        # What the leak implies, to compare with what the spawn meter caught (it misses very short processes).
+        if verdict["tokens_day"]:
+            verdict["implied_spawns_min"] = round(max(verdict["tokens_day"], 0) / 1440 / TOKENS_PER_PROCESS, 1)
+        step = max(len(week) // 168, 1)
+        series = [[round(t), l] for t, _, l in week[::step] if l is not None]
+        with self._lock:
+            self._kernel, self._kernel_series = verdict, series
+        return verdict
+
+    def kernel(self):
+        with self._lock:
+            return dict(self._kernel or {}, series=list(self._kernel_series))
+
+    def measure_spawns(self):
+        """One burst of the spawn meter, charged to agents and launchers."""
+        result = spawns.burst(SPAWN_BURST_S)
+        with self._lock:
+            extras, found = dict(self._extras), dict(self._sessions)
+        out = spawns.attribute(result, extras.get("member_of", {}), found, extras.get("own", frozenset()))
+        with self._lock:
+            self._spawns = out
+        return out
+
+    def spawn_stats(self):
+        with self._lock:
+            return dict(self._spawns)
 
     def check_ram_alert(self):
         vm = psutil.virtual_memory()
@@ -164,7 +220,37 @@ class App:
             return False
         self._last["alert"] = time.time()
         top = ", ".join(f"{i['label']} ({_gb(i['mb'])})" for i in self.consumers()[:2])
+        k = self._kernel or {}
+        if k.get("level") == "warn":
+            top = f"{_gb(k['leak_mb'])} retenidos en el kernel (solo se liberan reiniciando), " + top
         self.notify("DevReaper", f"RAM al {vm.percent:.0f} %. Lo que más pesa: {top}. Abre el panel para liberar.")
+        return True
+
+    def check_kernel_alert(self, now=None):
+        """The leak, at most once a day and never while snoozed."""
+        now = time.time() if now is None else now
+        k = self._kernel or {}
+        s = self.db.settings()
+        if (k.get("level") != "warn" or now < s["kernel_snooze_until"]
+                or now - s["kernel_alert_at"] < KERNEL_ALERT_EVERY_S):
+            return False
+        self.db.set_setting("kernel_alert_at", now)
+        self.notify("DevReaper: reinicia cuando puedas", k["message"])
+        return True
+
+    def check_commit_alert(self, now=None):
+        """Committed memory near its limit: at 100 % Windows refuses memory to programs."""
+        now = time.time() if now is None else now
+        k = self._kernel or {}
+        level = k.get("commit_level")
+        if level not in COMMIT_ALERT_EVERY_S or now - self.db.settings()["commit_alert_at"] < COMMIT_ALERT_EVERY_S[level]:
+            return False
+        self.db.set_setting("commit_alert_at", now)
+        msg = (f"Memoria comprometida al {k['commit_pct']:.0f} % del límite ({_gb(k['commit_mb'])} de "
+               f"{_gb(k['commit_limit_mb'])}). Al llegar al 100 % Windows empieza a negar memoria a los programas.")
+        if k.get("level") == "warn":
+            msg += f" {_gb(k['leak_mb'])} son del kernel: reiniciar los libera."
+        self.notify("DevReaper", msg)
         return True
 
     # ---------- views ----------
@@ -186,6 +272,10 @@ class App:
             "sessions_mb": round(sum(s["mb"] for s in found.values()), 1),
             "agents_active": sum(1 for s in found.values() if s["state"] == "active"),
             "infra_mb": round(inf["vm_mb"] + inf["docker_host_mb"], 1),
+            "kernel_level": (self._kernel or {}).get("level", "ok"),
+            "leak_mb": (self._kernel or {}).get("leak_mb"),
+            "commit_pct": (self._kernel or {}).get("commit_pct"),
+            "commit_level": (self._kernel or {}).get("commit_level", "ok"),
             "freed_7d_mb": self.db.freed_since(time.time() - 7 * 86400),
             "cpu": self._live[-1]["cpu"] if self._live else 0.0,
         }
@@ -206,7 +296,7 @@ class App:
             "system": {"total_mb": vm.total / 2**20, "used_mb": (vm.total - vm.available) / 2**20,
                        "percent": vm.percent, "cpus": scanner.NCPU},
             "groups": groups,
-            "sessions": session_rows(found, groups, excluded, now),
+            "sessions": session_rows(found, groups, excluded, now, self.spawn_stats().get("by_agent")),
             "ports": port_rows(groups, listeners, inf["containers"], excluded, self.db.port_history()),
             "worktrees": {"rows": worktree_rows(wts["rows"], groups, inf["containers"], found.values(), excluded),
                           "error": wts["error"], "updated": wts["updated"]},
@@ -219,6 +309,8 @@ class App:
             "log": self.db.kill_log(),
             "summary": self.summary(),
             "live": self._live[-1] if self._live else None,
+            "kernel": self.kernel(),
+            "spawns": self.spawn_stats(),
         }
 
     # ---------- actions ----------
@@ -299,6 +391,26 @@ class App:
                 r = self._kill_session(s["pid"], origin)
             except (KeyError, ValueError, psutil.Error) as e:
                 log.info("skipped idle agent %s: %s", s["pid"], e)
+                continue
+            total["killed"] += r["killed"] + 1
+            total["freed_mb"] = round(total["freed_mb"] + r["freed_mb"], 1)
+            total["kept"] += r["kept"]
+        return total
+
+    def _kill_agents(self, pids, origin):
+        """Close the listed terminal agents that are still inactive (an agent used meanwhile is skipped)."""
+        total = {"killed": 0, "freed_mb": 0.0, "kept": 0}
+        found = self.agents()
+        for pid in pids:
+            s = found.get(pid)
+            if not s or s.get("kind") != "cli" or s["state"] != "inactive":
+                total["kept"] += 1
+                continue
+            try:
+                r = self._kill_session(pid, origin)
+            except (KeyError, ValueError, psutil.Error) as e:
+                log.info("skipped agent %s: %s", pid, e)
+                total["kept"] += 1
                 continue
             total["killed"] += r["killed"] + 1
             total["freed_mb"] = round(total["freed_mb"] + r["freed_mb"], 1)
@@ -397,6 +509,8 @@ class App:
             return self._kill_agent_procs(int(body["pid"]), origin)
         if name == "kill-idle-agents":
             return self._kill_idle_agents(float(body.get("hours", 24)), origin)
+        if name == "kill-agents":
+            return self._kill_agents([int(p) for p in body["pids"]], origin)
         if name == "kill-selected":
             return self._kill_selected([str(i) for i in body["ids"]], origin)
         if name == "keep-alive":
@@ -440,6 +554,12 @@ class App:
                 raise ValueError("esa carpeta ya no existe")
             os.startfile(path)
             return {"ok": True}
+        if name == "kernel-snooze":
+            days = float(body.get("days", 7))
+            if not 0 <= days <= 30:
+                raise ValueError("se puede silenciar entre 0 y 30 días")
+            self.db.set_setting("kernel_snooze_until", time.time() + days * 86400)
+            return {"ok": True}
         if name == "open-startup":
             startup.open_startup_folder()
             startup.reveal_launcher()
@@ -480,8 +600,11 @@ class App:
             self.refresh_worktrees()
         if now - self._last["sample"] >= SAMPLE_EVERY_S - 1:
             self._last["sample"] = now
+            self.refresh_kernel()
             self.sample_ram()
         self.check_ram_alert()
+        self.check_kernel_alert()
+        self.check_commit_alert()
         if now - self._last["prune"] >= PRUNE_EVERY_S:
             self._last["prune"] = now
             self.db.prune()
@@ -489,7 +612,7 @@ class App:
     def start(self):
         self.rescan()
         loops = [(SCAN_EVERY_S, self.rescan, "scan"), (AUTO_CHECK_EVERY_S, self._auto_tick, "auto cycle"),
-                 (INFRA_EVERY_S, self._slow_tick, "slow loop")]
+                 (INFRA_EVERY_S, self._slow_tick, "slow loop"), (SPAWN_EVERY_S, self.measure_spawns, "spawn meter")]
         for every, fn, label in loops:
             threading.Thread(target=self._loop, args=(every, fn, label), daemon=True).start()
         threading.Thread(target=self._safe_first_slow_tick, daemon=True).start()
@@ -508,9 +631,11 @@ def _gb(mb):
     return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
 
 
-def session_rows(found, groups, excluded_ports, now):
-    """One row per open agent (Claude Code, Codex, Cursor…) with the dev processes it launched, heaviest first."""
+def session_rows(found, groups, excluded_ports, now, spawn_rates=None):
+    """One row per open agent (Claude Code, Codex, Cursor…) with the dev processes it launched, heaviest first.
+    `spawn_rates`: {agent pid: processes started per minute} from the last spawn burst."""
     rows = []
+    spawn_rates = spawn_rates or {}
     for s in found.values():
         mine = [g for g in groups if g["session"] and g["session"]["pid"] == s["pid"]]
         groups_mb = sum(g["mb"] for g in mine)
@@ -526,6 +651,7 @@ def session_rows(found, groups, excluded_ports, now):
             "groups_mb": round(groups_mb, 1),
             "total_mb": round(s["mb"] + groups_mb, 1),
             "protected": sum(1 for g in mine if set(g["ports"]) & excluded_ports),
+            "spawn_rate": spawn_rates.get(s["pid"], 0.0),
         })
     return sorted(rows, key=lambda r: r["total_mb"], reverse=True)
 

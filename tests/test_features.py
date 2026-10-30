@@ -2,7 +2,9 @@
 these tests must never stop a real container or shut down WSL."""
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.request
@@ -69,29 +71,51 @@ def test_repo_of():
     assert worktrees.repo_of(r"C:\w\repo\.worktrees\wt") == r"C:\w\repo"
 
 
-def test_parse_worktree_list():
-    text = ("worktree C:/w/repo\nHEAD abc\nbranch refs/heads/main\n\n"
-            "worktree C:/w/repo/.worktrees/a\nHEAD def\nbranch refs/heads/feat-a\n\n"
-            "worktree C:/w/repo/.worktrees/b\nHEAD 123\ndetached\nprunable gitdir file points to non-existent location\n")
-    rows = worktrees.parse_worktree_list(text)
-    assert [r["branch"] for r in rows] == ["main", "feat-a", None]
-    assert rows[2]["detached"] and rows[2]["prunable"]
-    assert rows[1]["path"] == os.path.normpath("C:/w/repo/.worktrees/a")
-
-
-def test_parse_refs():
-    refs = worktrees.parse_refs("main||1790000000\nfeat-a|[gone]|1789000000\nfeat-b|[ahead 2]|1788000000\n")
-    assert refs["feat-a"] == {"gone": True, "date": 1789000000}
-    assert not refs["feat-b"]["gone"]
-
-
 def test_classify(tmp_path):
     wt = {"path": str(tmp_path), "branch": "feat", "detached": False, "prunable": False}
-    assert worktrees.classify(wt, "main", {"feat"}, {}, False) == "merged"
-    assert worktrees.classify(wt, "main", set(), {"feat": {"gone": True}}, False) == "gone"
-    assert worktrees.classify(wt, "main", set(), {}, False) == "open"
-    assert worktrees.classify(wt, "main", set(), {}, True) == "main"
-    assert worktrees.classify(dict(wt, path=str(tmp_path / "nope")), "main", set(), {}, False) == "missing"
+    assert worktrees.classify(wt, "main", {"feat"}, False, False) == "merged"
+    assert worktrees.classify(wt, "main", set(), True, False) == "gone"
+    assert worktrees.classify(wt, "main", set(), False, False) == "open"
+    assert worktrees.classify(wt, "main", set(), False, True) == "main"
+    assert worktrees.classify(dict(wt, path=str(tmp_path / "nope")), "main", set(), False, False) == "missing"
+
+
+def _git(*args, cwd):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not installed")
+def test_worktrees_read_from_git_files_match_git(tmp_path, monkeypatch):
+    """Branches, worktrees, upstreams and merged state come from .git files; git runs only for --merged,
+    and not again until a ref moves."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "one", cwd=repo)
+    _git("branch", "merged-one", cwd=repo)
+    _git("worktree", "add", "-q", str(repo / ".worktrees" / "done"), "merged-one", cwd=repo)
+    _git("worktree", "add", "-q", "-b", "feat", str(repo / ".worktrees" / "feat"), cwd=repo)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "two",
+         cwd=repo / ".worktrees" / "feat")
+    _git("worktree", "add", "-q", "-b", "gone-one", str(repo / ".worktrees" / "gone"), cwd=repo)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "three",
+         cwd=repo / ".worktrees" / "gone")
+    _git("config", "branch.gone-one.remote", "origin", cwd=repo)
+    _git("config", "branch.gone-one.merge", "refs/heads/gone-one", cwd=repo)
+    _git("pack-refs", "--all", cwd=repo)  # tips must also be found in packed-refs
+
+    calls = []
+    real = worktrees.quiet.run
+    monkeypatch.setattr(worktrees.quiet, "run", lambda args, **kw: calls.append(args[3:5]) or real(args, **kw))
+    rows = {r["name"]: r for r in worktrees.scan_worktrees([], [], [str(repo)])["rows"]}
+    assert rows["(principal)"]["status"] == "main" and rows["(principal)"]["branch"] == "main"
+    assert rows["done"]["status"] == "merged" and rows["done"]["base"] == "main"
+    assert rows["feat"]["status"] == "open"
+    assert rows["gone"]["status"] == "gone"
+    assert all(r["last_commit"] > 1_600_000_000 for r in rows.values())
+    calls.clear()
+    worktrees.scan_worktrees([], [], [str(repo)])
+    assert calls == []  # nothing moved: no git process at all
 
 
 def test_find_repos_only_with_linked_worktrees(tmp_path):
@@ -103,13 +127,29 @@ def test_find_repos_only_with_linked_worktrees(tmp_path):
 
 
 # ---------- infra parsing ----------
-def test_parse_ports_and_mem_and_labels():
-    ports = infra.parse_ports("0.0.0.0:5432->5432/tcp, :::5432->5432/tcp, 127.0.0.1:3990->3000/tcp, 0.0.0.0:53->53/udp")
-    assert [(p["host_ip"], p["host_port"]) for p in ports] == [("0.0.0.0", 5432), ("127.0.0.1", 3990)]
-    assert infra.parse_mem("364.8MiB / 15.58GiB") == 364.8
-    assert infra.parse_mem("1.5GiB / 15GiB") == 1536.0
-    assert infra.parse_mem("") == 0.0
-    assert infra.parse_labels("a=1,b=c=d,broken")["b"] == "c=d"
+def test_docker_api_ports_and_memory():
+    ports = infra.api_ports([{"IP": "0.0.0.0", "PrivatePort": 5432, "PublicPort": 5432, "Type": "tcp"},
+                             {"IP": "::", "PrivatePort": 5432, "PublicPort": 5432, "Type": "tcp"},
+                             {"IP": "127.0.0.1", "PrivatePort": 3000, "PublicPort": 3990, "Type": "tcp"},
+                             {"IP": "0.0.0.0", "PrivatePort": 53, "PublicPort": 53, "Type": "udp"},
+                             {"PrivatePort": 9000, "Type": "tcp"}])  # exposed but not published
+    assert [(p["host_ip"], p["host_port"], p["container_port"]) for p in ports] == [
+        ("0.0.0.0", 5432, 5432), ("127.0.0.1", 3990, 3000)]
+    assert infra.stats_mb({"memory_stats": {"usage": 300 * 2**20, "stats": {"inactive_file": 100 * 2**20}}}) == 200
+    assert infra.stats_mb({"memory_stats": {"usage": 50 * 2**20, "stats": {"total_inactive_file": 10 * 2**20}}}) == 40
+    assert infra.stats_mb({}) == 0
+
+
+def test_parse_http_chunked_and_plain():
+    raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n[{\"a\"\r\n3\r\n:1}\r\n1\r\n]\r\n0\r\n\r\n"
+    assert infra.parse_http(raw) == (200, b'[{"a":1}]')
+    assert infra.parse_http(b"HTTP/1.1 204 No Content\r\n\r\n") == (204, b"")
+    assert infra.parse_http(b"garbage") == (0, b"")
+
+
+def test_docker_unreachable_is_none(monkeypatch):
+    monkeypatch.setattr(infra, "docker_pipe", lambda: r"\\.\pipe\devreaper-no-such-pipe")
+    assert infra.docker_containers() is None
 
 
 def test_quiet_decode_utf16():

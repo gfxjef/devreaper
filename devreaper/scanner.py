@@ -13,6 +13,8 @@ NCPU = psutil.cpu_count() or 1
 GROUP_ACTIVE = 0.015  # CPU share of one core above which a dev server counts as being used
 
 IGNORE_FRAGMENTS = ("\\adobe\\",)
+# Everyday browsers get their own band in the RAM chart. Playwright's Chromium is a dev process, not a browser.
+BROWSER_NAMES = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe"}
 GENERIC_DIRS = {"frontend", "backend", "web", "app", "client", "server", "api", "src"}
 WORKTREE_RE = re.compile(r"([^\\/\"]+)[\\/]\.worktrees[\\/]([^\\/\"\s]+)", re.I)
 NODE_MODULES_RE = re.compile(r"([^\\/\"]+)[\\/]([^\\/\"]+)[\\/]node_modules[\\/]", re.I)
@@ -154,14 +156,16 @@ def listening_sockets():
 
 def owned_by(rec, user) -> bool:
     key = (rec["pid"], rec["create_time"])
-    if key not in _owner_cache:
+    hit = _owner_cache.get(key)
+    if hit is None:
         try:
-            _owner_cache[key] = bool(user) and rec["proc"].username().lower() == user
+            hit = bool(user) and rec["proc"].username().lower() == user
         except psutil.Error:
-            _owner_cache[key] = False
-        if len(_owner_cache) > 5000:
+            hit = False
+        if len(_owner_cache) > 5000:  # clear before storing: the answer must survive the reset
             _owner_cache.clear()
-    return _owner_cache[key]
+        _owner_cache[key] = hit
+    return hit
 
 
 def build_groups(dev, procs, stop=frozenset()):
@@ -230,11 +234,13 @@ DISK_EVERY_S = 30
 
 def _cwd(rec):
     key = (rec["pid"], rec["create_time"])
-    if key not in _cwd_cache:
-        _cwd_cache[key] = agents_mod.agent_cwd(rec["pid"])
-        if len(_cwd_cache) > 2000:
+    hit = _cwd_cache.get(key)
+    if hit is None:
+        hit = agents_mod.agent_cwd(rec["pid"])
+        if len(_cwd_cache) > 2000:  # clear before storing: the answer must survive the reset
             _cwd_cache.clear()
-    return _cwd_cache[key]
+        _cwd_cache[key] = hit
+    return hit
 
 
 def _disk_activity(a, cwd, session_id, now):
@@ -290,8 +296,22 @@ def build_agents(procs, found, user, activity, settings, now):
     return out, member_of
 
 
-def scan(settings, sessions, db, excluded_ports, self_pid=None, activity=None):
-    """Returns (groups, listeners, agents). `sessions`: Claude session files keyed by claude.exe PID."""
+def browsers_mb(procs, skip):
+    """RAM of everyday browsers (every process of Chrome, Edge, Firefox…), excluding PIDs in `skip`."""
+    total = 0.0
+    for pid, rec in procs.items():
+        if pid in skip or rec["name"].lower() not in BROWSER_NAMES:
+            continue
+        try:
+            total += rec["proc"].memory_info().rss / 2**20
+        except psutil.Error:
+            continue
+    return round(total, 1)
+
+
+def scan(settings, sessions, db, excluded_ports, self_pid=None, activity=None, extras=None):
+    """Returns (groups, listeners, agents). `sessions`: Claude session files keyed by claude.exe PID.
+    `extras`, if given, is filled with what other meters reuse: browsers_mb, member_of, own."""
     now = time.time()
     activity = activity or agents_mod.Activity(now)
     self_pid = self_pid or os.getpid()
@@ -432,6 +452,10 @@ def scan(settings, sessions, db, excluded_ports, self_pid=None, activity=None):
             "visible": mb >= settings["show_min_mb"] or age_h >= settings["show_min_age_hours"] or state == "orphan",
         })
     out.sort(key=lambda g: g["mb"], reverse=True)
+    if extras is not None:
+        in_groups = {pid for g in out for pid in g["pids"]}
+        extras.update(browsers_mb=browsers_mb(procs, in_groups | set(member_of)), member_of=dict(member_of),
+                      own=frozenset(own))
     live |= {("agent", pid, a["create_time"]) for pid, a in agents.items()}
     activity.forget(live)
 
