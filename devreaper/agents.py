@@ -13,6 +13,8 @@ from pathlib import Path
 
 import psutil
 
+from .redact import redact
+
 HOME = Path.home()
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
@@ -142,7 +144,7 @@ def find_agents(procs, user=None):
                 continue
         _details(rec)
         agents[pid] = {"pid": pid, "create_time": rec["create_time"], "agent_key": key, "agent": display,
-                       "kind": kind, "cmd": rec["cmd"][:300], "exe": rec["exe"]}
+                       "kind": kind, "cmd": redact(rec["cmd"])[:300], "exe": rec["exe"]}
     member_of = {p: r for p, r in member_of.items() if r in agents}
     return agents, member_of
 

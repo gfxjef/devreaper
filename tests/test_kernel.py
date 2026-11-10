@@ -103,9 +103,47 @@ def test_attribute_charges_agents_launchers_and_self():
                            own=frozenset({99}))
     assert out["by_agent"] == {10: 12.0}  # 2 in 10 s = 12/min, one through a bash child
     labels = {r["label"]: r for r in out["launchers"]}
-    assert labels["Claude Code · siek"]["children"][0] == {"name": "git.exe", "rate": 12.0}
+    assert labels["Claude Code · siek"]["children"][0] == {"name": "git", "rate": 12.0}
     assert labels["com.docker.backend.exe"]["rate"] == 6.0
     assert "DevReaper" in labels and out["rate"] == 24.0
+
+
+@pytest.mark.parametrize("name,cmd,sig,source", [
+    ("git.exe", r'git -C "C:\w\siek_api" status --porcelain', "git status --porcelain", None),
+    ("git.exe", r"git --no-pager -c core.fsmonitor= rev-list --count HEAD..@{u}", "git rev-list --count HEAD..@{u}", None),
+    ("git.exe", "git -c submodule.recurse=false -c log.showSignature=false -c gc.auto=0 status --porcelain=v2",
+     "git (seguimiento de Claude Code)", "claude-git"),
+    ("powershell.exe", "powershell -NoProfile -Command Get-NetTCPConnection -LocalPort 3000 -State Listen",
+     "powershell -Command Get-NetTCPConnection -LocalPort N", None),
+    ("node.exe", r"C:\nodejs\node.exe C:\x\npx-cli.js --yes vercel@latest ls --token ***", "node npx-cli.js --yes vercel@latest", None),
+    ("conhost.exe", "", "conhost", None),
+    ("docker.exe", '"C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe" stats --all --no-stream',
+     "docker stats --all --no-stream", None),
+])
+def test_signature_groups_repeated_commands(name, cmd, sig, source):
+    assert spawns.signature(name, cmd) == (sig, source)
+
+
+def test_repeated_commands_and_claude_git_are_reported():
+    table = {10: (1, "claude.exe")}
+    new = {}
+    for i in range(6):
+        new[100 + i] = (10, "git.exe", r'git -C "C:\w" status --porcelain')
+        table[100 + i] = new[100 + i][:2]
+    new[200] = (10, "git.exe", "git -c submodule.recurse=false -c gc.auto=0 status")
+    table[200] = new[200][:2]
+    out = spawns.attribute({"seconds": 10.0, "new": new, "table": table}, {10: 10}, {10: {"name": "s"}})
+    assert out["repeated"][0] == {"cmd": "git status --porcelain", "launcher": "Agente · s", "agent_pid": 10, "rate": 36.0}
+    assert out["launchers"][0]["claude_git_rate"] == 6.0
+
+
+def test_burst_reads_each_new_command_once():
+    frames = iter([{1: (0, "a")}, {1: (0, "a"), 2: (1, "git.exe")}, {1: (0, "a"), 2: (1, "git.exe")}])
+    clock = iter([0.0, 0.1, 0.2, 0.3, 0.3])
+    asked = []
+    r = spawns.burst(0.25, table_fn=lambda: next(frames), cmd_fn=lambda pid: asked.append(pid) or "git status",
+                     clock=lambda: next(clock), sleep=lambda s: None)
+    assert asked == [2] and r["new"][2] == (1, "git.exe", "git status")
 
 
 def test_session_rows_carry_spawn_rate():
@@ -195,6 +233,40 @@ def test_kill_agents_closes_only_still_inactive_terminal_agents(kapp, monkeypatc
                         lambda pid, origin: closed.append(pid) or {"killed": 2, "freed_mb": 500.0, "kept": 0})
     r = kapp.action("kill-agents", {"pids": [1, 2, 3, 4]}, origin="bandeja")
     assert closed == [1] and r == {"killed": 3, "freed_mb": 500.0, "kept": 3}
+
+
+def test_automated_browser_found_only_with_automation_flags(monkeypatch):
+    from devreaper import scanner
+    monkeypatch.setattr(scanner.agents_mod, "tree_mb", lambda pids, procs: 100.0 * len(pids))
+
+    def rec(pid, ppid, name, cmd=""):
+        return {"pid": pid, "ppid": ppid, "name": name, "create_time": pid, "cmd": cmd, "proc": None}
+    procs = {1: rec(1, 0, "node.exe"), 2: rec(2, 1, "chrome.exe", "chrome.exe --remote-debugging-pipe --user-data-dir=x"),
+             3: rec(3, 2, "chrome.exe", "chrome.exe --type=renderer"), 4: rec(4, 1, "chrome.exe", "chrome.exe")}
+    children = {1: [2, 4], 2: [3]}
+    b = scanner.automated_browser([1, 2, 3, 4], procs, children)
+    assert b["pid"] == 2 and b["pids"] == [2, 3] and b["mb"] == 200.0
+    assert scanner.automated_browser([1, 4], procs, children) is None  # a user's own Chrome is never "automated"
+
+
+def test_idle_automation_browser_is_closed_after_the_set_minutes(kapp, monkeypatch):
+    now = 1e9
+    browser = {"pid": 5, "create_time": now - 7200, "pids": [5, 6], "mb": 640.0}
+    base = {"id": "g", "label": "Playwright MCP", "browser": browser, "excluded": False, "keep_until": 0}
+    kapp._groups = [dict(base, idle_hours=0.6), dict(base, id="busy", idle_hours=0.1),
+                    dict(base, id="kept", idle_hours=5, keep_until=now + 60), dict(base, id="none", browser=None, idle_hours=9)]
+    closed = []
+    monkeypatch.setattr(kapp, "_close_browser", lambda g, reason, origin: closed.append((g["id"], origin)) or {"killed": 1})
+    assert kapp.close_idle_browsers(now=now) == 1 and closed == [("g", "automático")]
+    kapp.action("settings", {"close_idle_browser_minutes": 0})
+    assert kapp.close_idle_browsers(now=now) == 0
+
+
+def test_tray_suggests_memory_saver_and_closing_the_automation_browser():
+    from devreaper import tray
+    assert tray.browser_tips({"chrome.exe": 5800, "msedge.exe": 500, "firefox.exe": 9000})[0]["action"] == (
+        "browser-settings", {"browser": "chrome.exe"})
+    assert len(tray.browser_tips({"chrome.exe": 5800, "msedge.exe": 500, "firefox.exe": 9000})) == 1
 
 
 def test_refresh_kernel_stores_and_assesses(kapp, monkeypatch):

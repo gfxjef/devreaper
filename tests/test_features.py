@@ -321,5 +321,7 @@ def test_server_assets_csp_and_ram_endpoint(no_docker):
         assert data["hours"] == 24 and data["series"] == []
         state = json.load(urllib.request.urlopen(base + "/api/state"))
         assert {"ports", "worktrees", "infra"} <= set(state)
+        ports = json.load(urllib.request.urlopen(base + "/api/ports"))
+        assert ports["listening"] == sorted({l["port"] for l in a._listeners}) and ports["scanned_at"] > 0
     finally:
         srv.shutdown()

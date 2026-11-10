@@ -1,6 +1,7 @@
 """App core: periodic scan, actions, the 24 h auto-close cycle, and the slower infra/worktree/RAM loops."""
 import logging
 import os
+import subprocess
 import threading
 import time
 from collections import deque
@@ -8,6 +9,7 @@ from collections import deque
 import psutil
 
 from . import agents, infra, kernel, projects, reaper, scanner, sessions, spawns, startup, winapi, worktrees
+from .redact import redact
 
 log = logging.getLogger("devreaper")
 
@@ -25,6 +27,10 @@ SPAWN_EVERY_S = 300
 SPAWN_BURST_S = 10
 KERNEL_ALERT_EVERY_S = 86400
 COMMIT_ALERT_EVERY_S = {"warn": 86400, "crit": 3 * 3600}
+# Memory-saver settings page of each browser (opened with the browser's own exe; other apps cannot open them)
+MEMORY_SAVER_PAGES = {"chrome.exe": "chrome://settings/performance",
+                      "msedge.exe": "edge://settings/system/managePerformance",
+                      "brave.exe": "brave://settings/performance"}
 TOKENS_PER_PROCESS = 1.5  # tokens a leaking driver keeps per process started (measured on an affected machine)
 EMPTY_INFRA = {"vm_mb": 0.0, "vm_running": False, "docker_host_mb": 0.0, "docker_running": False,
                "containers": [], "docker_cli": False, "distros": [], "updated": 0}
@@ -45,7 +51,7 @@ class App:
         self._live = deque(maxlen=LIVE_POINTS)
         self._group_live = {}
         self._history = {"dirs": [], "at": 0.0}
-        self._extras = {"browsers_mb": 0.0, "member_of": {}, "own": frozenset()}
+        self._extras = {"browsers_mb": 0.0, "browsers": {}, "member_of": {}, "own": frozenset()}
         self._pool = winapi.ResidentPagedPool()
         self._kernel = None
         self._kernel_series = []
@@ -85,6 +91,14 @@ class App:
         with self._lock:
             return dict(self._sessions)
 
+    def listening_ports(self):
+        with self._lock:
+            return sorted({l["port"] for l in self._listeners})
+
+    def scanned_at(self):
+        with self._lock:
+            return self._scanned_at
+
     def containers(self):
         with self._lock:
             return list(self._infra["containers"])
@@ -104,6 +118,7 @@ class App:
             "kernel_mb": kernel.resident_mb({"paged_resident_mb": self._pool.read_mb(),
                                              "nonpaged_mb": perf.get("nonpaged_mb")}),
             "browsers_mb": extras.get("browsers_mb", 0.0),
+            "browsers": extras.get("browsers", {}),
             "commit_mb": perf.get("commit_mb"), "commit_limit_mb": perf.get("commit_limit_mb"),
             "cpu": psutil.cpu_percent(None),
         })
@@ -397,6 +412,59 @@ class App:
             total["kept"] += r["kept"]
         return total
 
+    def _close_browser(self, g, reason, origin):
+        """Close only the automation browser of a group (Playwright MCP opens a new one when it needs it)."""
+        b = g.get("browser")
+        if not b:
+            raise ValueError(f"{g['label']} no tiene un navegador abierto")
+        proc = psutil.Process(b["pid"])
+        if abs(proc.create_time() - b["create_time"]) > 1:
+            raise ValueError("ese navegador ya se cerró")
+        reaper.ensure_user_process(proc)
+        if not reaper.kill_tree(proc):
+            return {"killed": 0, "freed_mb": 0.0}
+        self.db.log_kill({"label": f"Navegador de {g['label']}", "pids": b["pids"], "ports": [], "mb": b["mb"],
+                          "age_hours": round((time.time() - b["create_time"]) / 3600, 2),
+                          "cmd": f"{proc.name()} (navegador automatizado)"}, reason, origin)
+        log.info("closed browser of %s pid=%s reason=%s origin=%s", g["label"], b["pid"], reason, origin)
+        self.rescan()
+        return {"killed": 1, "freed_mb": b["mb"]}
+
+    def _browser_settings(self, name):
+        """Open the browser's memory-saver page (chrome://… pages only open from the browser's own exe)."""
+        url = MEMORY_SAVER_PAGES.get(name)
+        if not url:
+            raise ValueError(f"no sé abrir los ajustes de memoria de {name}")
+        for p in psutil.process_iter():
+            try:
+                if p.name().lower() == name and p.parent() and p.parent().name().lower() != name:
+                    exe = p.exe()
+                    break
+            except psutil.Error:
+                continue
+        else:
+            raise ValueError(f"{name} no está abierto")
+        subprocess.Popen([exe, url], close_fds=True)
+        return {"ok": True}
+
+    def close_idle_browsers(self, now=None):
+        """Automation browsers whose group has used no CPU for `close_idle_browser_minutes`."""
+        now = time.time() if now is None else now
+        minutes = self.db.settings()["close_idle_browser_minutes"]
+        if not minutes:
+            return 0
+        closed = 0
+        for g in self.groups():
+            b = g.get("browser")
+            if (not b or g.get("excluded") or g.get("keep_until", 0) > now
+                    or g["idle_hours"] * 60 < minutes or now - b["create_time"] < minutes * 60):
+                continue
+            try:
+                closed += self._close_browser(g, f"navegador sin uso {minutes:g} min", "automático")["killed"]
+            except (ValueError, psutil.Error) as e:
+                log.info("skipped idle browser of %s: %s", g["label"], e)
+        return closed
+
     def _kill_agents(self, pids, origin):
         """Close the listed terminal agents that are still inactive (an agent used meanwhile is skipped)."""
         total = {"killed": 0, "freed_mb": 0.0, "kept": 0}
@@ -476,7 +544,7 @@ class App:
         reaper.ensure_user_process(p)
         g = {"root_pid": p.pid, "create_time": p.create_time(), "pids": [p.pid], "label": p.name(),
              "ports": [port], "mb": round(p.memory_info().rss / 2**20, 1), "age_hours": 0,
-             "cmd": " ".join(p.cmdline())[:300]}
+             "cmd": redact(" ".join(p.cmdline()))[:300]}
         return self._kill([g], reason, origin)
 
     def _wsl_shutdown(self, origin):
@@ -509,6 +577,10 @@ class App:
             return self._kill_agent_procs(int(body["pid"]), origin)
         if name == "kill-idle-agents":
             return self._kill_idle_agents(float(body.get("hours", 24)), origin)
+        if name == "close-browser":
+            return self._close_browser(self._group(str(body["id"])), "cerrar navegador", origin)
+        if name == "browser-settings":
+            return self._browser_settings(str(body.get("browser", "chrome.exe")))
         if name == "kill-agents":
             return self._kill_agents([int(p) for p in body["pids"]], origin)
         if name == "kill-selected":
@@ -602,6 +674,7 @@ class App:
             self._last["sample"] = now
             self.refresh_kernel()
             self.sample_ram()
+        self.close_idle_browsers()
         self.check_ram_alert()
         self.check_kernel_alert()
         self.check_commit_alert()
@@ -743,6 +816,11 @@ def worktree_rows(wt_rows, groups, containers, found, excluded):
 def _validate(key, value):
     if key == "auto_enabled":
         return bool(value)
+    if key == "close_idle_browser_minutes":
+        value = float(value)
+        if not 0 <= value <= 24 * 60:
+            raise ValueError("los minutos deben estar entre 0 (desactivado) y 1440")
+        return value
     if key in ("auto_interval_hours", "auto_max_age_hours", "show_min_mb", "show_min_age_hours",
                "inactive_after_hours"):
         value = float(value)

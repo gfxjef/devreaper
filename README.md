@@ -66,7 +66,9 @@ cierra DevReaper desde el menú de la bandeja (Salir) y vuelve a abrir `DevReape
 ## Vistas
 
 - **Procesos**: cada grupo de procesos con estado, RAM de los últimos 15 minutos (mini gráfica), CPU, último
-  uso, puertos y qué hará el cierre automático con él. Filtros por estado (activos, inactivos, huérfanos, sin
+  uso, puertos y qué hará el cierre automático con él. Si un grupo abrió un navegador automatizado (Playwright
+  MCP, Puppeteer), "Cerrar solo el navegador" lo cierra sin tocar el servidor MCP, que abre otro cuando lo
+  necesita; tras 30 minutos sin uso se cierra solo (Ajustes, 0 = nunca). Filtros por estado (activos, inactivos, huérfanos, sin
   agente), "Agrupar por agente", selección múltiple con "Cerrar seleccionados" y "No cerrar automáticamente
   en 24 h". La RAM de un grupo incluye a sus hijos que no son de desarrollo (esbuild, el binario de `go run`…).
 - **Agentes**: cada agente abierto, su actividad, su RAM, la de lo que lanzó y cuántos procesos lanza por
@@ -122,8 +124,12 @@ de procesos por hora (git de los agentes, docker) suman ~1 GB al día. Solo se r
 - Memoria comprometida: aviso al 85 % del límite (una vez al día) y al 95 % (cada 3 h). Al 100 % Windows niega
   memoria a los programas aunque parezca haber RAM libre.
 - **Quién lanza procesos**: cada 5 minutos, durante 10 s, DevReaper toma una foto de la tabla de procesos cada
-  0,1 s y atribuye cada proceso nuevo a su agente o al programa que lo lanzó. Los que viven menos de 0,1 s no se
-  ven, así que la cifra es un mínimo.
+  0,1 s y atribuye cada proceso nuevo a su agente o al programa que lo lanzó, con su comando reducido a una firma
+  (`git status --porcelain`, `powershell -Command Get-NetTCPConnection…`): así se ven los comandos que se repiten
+  y qué parte es el seguimiento de git del propio Claude Code y qué parte son hooks, mods o statusline. Los que
+  viven menos de 0,1 s no se ven, así que la cifra es un mínimo.
+- **Navegadores**: si Chrome, Edge o Brave pasan de 4 GB, el panel y la bandeja ofrecen abrir su ahorro de
+  memoria. DevReaper nunca cierra tu navegador.
 - DevReaper mismo no lanza procesos para vigilar: Docker se lee por su API (named pipe `docker_engine`), WSL del
   registro y los repos directamente de su carpeta `.git`. Solo llama a `git` para saber qué ramas ya están
   integradas o para fechar un commit nuevo, y únicamente cuando una rama cambió.
@@ -140,11 +146,19 @@ DevReaper no escribe en la carpeta de Inicio: Bitdefender Endpoint Security lo t
 malware y bloquea PowerShell. Hazlo a mano: `Win + R` → `shell:startup`, y arrastra `DevReaper (inicio).cmd`
 con el botón derecho → "Crear acceso directo aquí". El panel (Ajustes) detecta si ya está configurado.
 
+## Para statuslines y mods
+
+`GET http://127.0.0.1:7777/api/ports` responde `{"listening": [puertos]}` con los puertos TCP que escuchan
+(DevReaper los mira cada 2 s). Sirve para saber si un servidor está arriba sin lanzar `powershell` ni
+`netstat` en cada consulta.
+
 ## Seguridad
 
 - Servidor solo en `127.0.0.1`; acciones con token por arranque, Host y Origin verificados.
 - CSP estricta y `frame-ancestors 'none'`: el panel no se puede incrustar en otra página.
 - Solo lista y cierra procesos de tu usuario; nunca de SYSTEM, servicios u otras cuentas.
+- Las líneas de comando se muestran y guardan sin secretos: `--token`, `--password`, `API_KEY=…`,
+  `https://usuario:clave@…`, `Bearer …` y tokens conocidos (`ghp_`, `sk-`, `xoxb-`…) quedan como `***`.
 - Los puertos protegidos sobreviven a todo: ciclo, cierres masivos, cerrar agente, cerrar proyecto, apagar WSL.
 - Nota para TI sobre Bitdefender: `docs/bitdefender-excepcion.md`.
 

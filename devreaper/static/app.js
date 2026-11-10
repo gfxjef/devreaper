@@ -45,6 +45,8 @@ const LAYERS = [["dev", "dev_mb", "Desarrollo"], ["agents", "agents_mb", "Agente
   ["rest", "rest", "Resto"]];
 const SPAWNING = 1; // processes per minute above which an idle agent "keeps launching processes"
 const KERNEL_FACT_MB = 2048;
+const BROWSER_TIP_MB = 4096;
+const BROWSER_LABELS = { "chrome.exe": "Chrome", "msedge.exe": "Edge", "brave.exe": "Brave" };
 // "Resto" is what no band explains. Kernel and browsers are null in samples taken before they were measured.
 const withRest = (p, keys) => ({ ...p, rest: Math.max(0, p.used_mb - keys.reduce((t, k) => t + (p[k] || 0), 0)) });
 
@@ -230,11 +232,26 @@ function renderPulse() {
     c.innerHTML = `Comprometida <b>${Math.round(k.commit_pct)} %</b> · ${mb(k.commit_mb)} de ${mb(k.commit_limit_mb)}`;
   }
   renderKernelBanner();
+  renderBrowserTip();
   renderLive();
 }
 
+// Heavy everyday browser: point at its own memory saver (DevReaper never closes the user's browser).
+function renderBrowserTip() {
+  const b = (S.live && S.live.browsers) || {}, tip = $("browser-tip");
+  const heavy = Object.entries(b).filter(([n, v]) => BROWSER_LABELS[n] && v >= BROWSER_TIP_MB).sort((x, y) => y[1] - x[1])[0];
+  tip.hidden = !heavy || +store.get("browser-tip-off") > Date.now();
+  if (tip.hidden) return;
+  const [name, size] = heavy, label = BROWSER_LABELS[name];
+  paint("browser-tip", `<span>${label} usa <b>${mb(size)}</b>. Con su ahorro de memoria en “Máximo”, las pestañas que no usas
+      liberan su RAM y se recargan al volver a ellas.</span>
+    <button class="btn" type="button" data-browser-settings="${esc(name)}">Abrir el ajuste de ${label}</button>
+    <button class="btn ghost" type="button" data-tip-off>Ocultar 7 días</button>`);
+}
+
 function leakEta(k) {
-  if (!k.eta_hours) return "";
+  if (k.eta_hours == null) return "";
+  if (k.eta_hours === 0) return "ya";
   const when = new Date(Date.now() + k.eta_hours * 3600e3);
   return when.toLocaleString("es-PE", { weekday: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 }
@@ -247,7 +264,7 @@ function renderKernelBanner() {
   const eta = leakEta(k);
   paint("kernel-banner", `<span class="k-ico">${WARN}</span>
     <span>Windows retiene <b>${mb(k.leak_mb)}</b> en el kernel y solo los devuelve al reiniciar: cerrar programas no ayuda.
-      ${k.growth_mb_day > 0 ? `Crece ${mb(k.growth_mb_day)} al día${eta ? `; a este ritmo llegas al 90 % el ${esc(eta)}` : ""}.` : ""}</span>
+      ${k.growth_mb_day > 0 ? `Crece ${mb(k.growth_mb_day)} al día${eta === "ya" ? " y ya pasaste el 90 %" : eta ? `; a este ritmo llegas al 90 % el ${esc(eta)}` : ""}.` : ""}</span>
     <button class="btn" type="button" data-view-go="ram">Ver detalle</button>
     <button class="btn ghost" type="button" data-snooze="7">No avisar en 7 días</button>`);
 }
@@ -423,7 +440,7 @@ function procRow(g, i) {
   return `<tr data-row="g" data-id="${esc(g.id)}" data-i="${i}" id="row-${esc(g.id)}" class="${isSel ? "sel" : ""}" tabindex="-1">
     <td class="cb"><input type="checkbox" data-sel="${esc(g.id)}" data-i="${i}" ${sel.has(g.id) ? "checked" : ""} aria-label="Seleccionar ${esc(g.label)}"></td>
     <td>${STATE_DOT(g.state)}</td>
-    <td><div class="label">${esc(g.label)}</div><div class="sub" title="${esc(g.cmd)}">${esc(g.kind)}${who ? " · " + who : ""}</div>${exposed}</td>
+    <td><div class="label">${esc(g.label)}</div><div class="sub" title="${esc(g.cmd)}">${esc(g.kind)}${who ? " · " + who : ""}${g.browser ? ` · navegador ${mb(g.browser.mb)}` : ""}</div>${exposed}</td>
     <td class="r"><span class="ramcell">${spark(g.id)}<span class="num ${g.mb >= S.settings.show_min_mb ? "heavy" : ""}">${mb(g.mb)}</span></span></td>
     <td class="r cpucell"><b class="num">${pct(g.cpu)}</b><div class="sub">${idleText(g)}</div></td>
     <td>${portChips(g.ports)}</td>
@@ -472,6 +489,11 @@ function renderProc() {
 }
 
 const spawningIdle = (s) => s.state === "inactive" && (s.spawn_rate || 0) >= SPAWNING;
+function topCommand(pid) {
+  const l = ((S.spawns && S.spawns.launchers) || []).find((r) => r.agent_pid === pid);
+  const c = l && l.children[0];
+  return c ? `<div class="sub" title="El comando que más lanza">Sobre todo: <code>${esc(c.name)}</code> ${Math.round(c.rate)}/min</div>` : "";
+}
 
 let sessOrder = [];
 function renderSess() {
@@ -486,7 +508,7 @@ function renderSess() {
       <td>${STATE_DOT(s.state)}</td>
       <td><div class="label">${esc(s.agent)} · ${esc(s.name)}</div><div class="sub" title="${esc(s.cwd)}">${esc(KIND_NAMES[s.kind] || "")} · ${esc(shortPath(s.cwd))}</div></td>
       <td><div>${agentIdle(s)}</div><div class="sub">Abierto hace ${dur(s.age_hours)} · CPU ${pct(s.cpu)}</div>
-        ${(s.spawn_rate || 0) >= SPAWNING ? `<div class="sub ${spawningIdle(s) ? "spawning" : ""}" title="Medido en ráfagas de 10 s cada 5 min: es un mínimo">Lanza ${Math.round(s.spawn_rate)} procesos/min${spawningIdle(s) ? " sin que nadie lo use" : ""}</div>` : ""}</td>
+        ${(s.spawn_rate || 0) >= SPAWNING ? `<div class="sub ${spawningIdle(s) ? "spawning" : ""}" title="Medido en ráfagas de 10 s cada 5 min: es un mínimo">Lanza ${Math.round(s.spawn_rate)} procesos/min${spawningIdle(s) ? " sin que nadie lo use" : ""}</div>${topCommand(s.pid)}` : ""}</td>
       <td class="r"><b class="num">${mb(s.total_mb)}</b><div class="sub">${esc(s.agent)} ${mb(s.mb)}${n ? ` + procesos ${mb(s.groups_mb)}` : ""}</div>
         <div class="stack" title="Agente / procesos que lanzó"><i class="s1" style="width:${share}%"></i>${n ? `<i class="s2" style="width:${100 - share}%"></i>` : ""}</div></td>
       <td>${n ? `<div class="chiplist">${chips}</div>` : '<span class="sub">Ninguno</span>'}
@@ -682,6 +704,8 @@ function renderInspector() {
     const folder = g.worktree || g.cwd;
     body = `<div class="why ${whyCls}">${esc(why)}</div>
       <div class="insp-actions">
+        ${g.browser ? confirmBtn({ act: "close-browser", arg: { id: g.id }, key: "ib:" + g.id, label: `Cerrar solo el navegador (${mb(g.browser.mb)})`, small: false,
+          ask: "¿Cerrar el navegador?", title: "Playwright abre uno nuevo la próxima vez que el agente lo use" }) : ""}
         ${g.excluded ? '<span class="kept">Protegido: tiene un puerto con candado</span>' : confirmBtn({ act: "kill", arg: { id: g.id }, key: "i:" + g.id, label: `Cerrar y liberar ${mb(g.mb)}`, small: false, ask: "¿Seguro? Clic de nuevo" })}
         ${g.keep_until ? `<button class="btn" type="button" data-keep="${esc(g.id)}" data-hours="0">Volver a permitir el cierre automático</button>`
           : `<button class="btn" type="button" data-keep="${esc(g.id)}" data-hours="24">No cerrar en 24 h</button><button class="btn" type="button" data-keep="${esc(g.id)}" data-hours="168">No cerrar en 7 días</button>`}
@@ -692,6 +716,7 @@ function renderInspector() {
         <dt>Abierto hace</dt><dd>${dur(g.age_hours)}</dd>
         <dt>Uso</dt><dd>${idleText(g)} · CPU ahora ${pct(g.cpu)}</dd>
         <dt>Procesos</dt><dd>${plural(g.pids.length, "proceso", "procesos")} · PID raíz ${g.root_pid}</dd>
+        ${g.browser ? `<dt>Navegador</dt><dd>${mb(g.browser.mb)} · abierto hace ${dur((Date.now() / 1000 - g.browser.create_time) / 3600)}${S.settings.close_idle_browser_minutes ? ` · se cierra solo tras ${S.settings.close_idle_browser_minutes} min sin uso` : ""}</dd>` : ""}
         ${folder ? `<dt>Carpeta</dt><dd title="${esc(folder)}">${esc(shortPath(folder))} <button class="btn small ghost" type="button" data-reveal="${esc(folder)}">Abrir</button></dd>` : ""}
       </dl>
       <h3>Puertos</h3>${portChips(g.ports)}
@@ -778,7 +803,7 @@ function renderBootCard() {
       <div><b class="${leakCls}">${k.leak_mb != null ? mb(k.leak_mb) : "—"}</b><span>retenidos en el kernel</span></div>
       <div><b>${k.growth_mb_day != null ? (k.growth_mb_day > 0 ? "+" : "") + mb(Math.abs(k.growth_mb_day)) : "—"}</b><span>por día (últimas 6 h)</span></div>
       <div><b class="${k.commit_level === "ok" ? "" : k.commit_level === "crit" ? "bad" : "warn"}">${k.commit_pct != null ? Math.round(k.commit_pct) + " %" : "—"}</b><span>memoria comprometida</span></div>
-      <div><b>${eta || "—"}</b><span>llegas al 90 % (a este ritmo)</span></div>
+      <div><b class="${eta === "ya" ? "bad" : ""}">${eta === "ya" ? "Ya pasaste" : eta || "—"}</b><span>${eta === "ya" ? "el 90 % de RAM o de memoria comprometida" : "llegas al 90 % (a este ritmo)"}</span></div>
     </div>
     ${leakSpark(k.series || [])}
     <p class="help">${k.level === "ok"
@@ -797,6 +822,7 @@ function renderSpawnCard() {
   const max = Math.max(...(sp.launchers || []).map((l) => l.rate), 1);
   const rows = (sp.launchers || []).slice(0, 6).map((l) => `<tr>
       <td><div class="label">${esc(l.label)}</div><div class="sub">${l.children.map((c) => `${esc(c.name)} ${Math.round(c.rate)}`).join(" · ")}</div>
+        ${l.claude_git_rate ? `<div class="sub">${Math.round(l.claude_git_rate)}/min son el seguimiento de git del propio Claude Code; el resto, hooks, mods, statusline o herramientas</div>` : ""}
         <div class="bar" style="width:${(l.rate / max * 100).toFixed(1)}%"></div></td>
       <td class="r"><b class="num">${Math.round(l.rate)}</b><div class="sub">/min</div></td>
       <td class="r">${l.agent_pid ? `<button class="btn small ghost" type="button" data-agent="${l.agent_pid}">Ver agente</button>` : ""}</td>
@@ -805,6 +831,8 @@ function renderSpawnCard() {
     ? `<p class="help">El kernel crece como si se lanzaran unos ${Math.round(k.implied_spawns_min)} procesos por minuto: muchos viven tan poco que no alcanzo a verlos.</p>` : "";
   paint("spawn-card", `<h3>Quién lanza procesos <span class="tag">al menos ${Math.round(sp.rate)} por minuto · medido hace ${dur((Date.now() / 1000 - sp.at) / 3600)}</span></h3>
     ${rows ? `<table class="launchers"><tbody>${rows}</tbody></table>` : '<p class="sub">Nadie lanzó procesos durante la última medición.</p>'}
+    ${(sp.repeated || []).length ? `<h4>Comandos que se repiten</h4><ul class="repeated">${sp.repeated.slice(0, 6).map((r) =>
+      `<li><code title="${esc(r.cmd)}">${esc(r.cmd)}</code><span class="who">${esc(r.launcher)}</span><b class="num">${Math.round(r.rate)}/min</b></li>`).join("")}</ul>` : ""}
     ${unseen}
     <p class="help">Medido en ráfagas de 10 s cada 5 minutos, sin lanzar nada: los procesos de menos de una décima de segundo no se ven, así que es un mínimo.</p>`);
 }
@@ -985,6 +1013,9 @@ document.addEventListener("click", (e) => {
     if (k === "proc") { stateFilter = "all"; preview = false; }
     return setView(k);
   }
+  const bs = t.closest("[data-browser-settings]");
+  if (bs) return run("browser-settings", { browser: bs.dataset.browserSettings }, "Ajuste abierto en el navegador: elige “Máximo”");
+  if (t.closest("[data-tip-off]")) { store.set("browser-tip-off", String(Date.now() + 7 * 86400e3)); return render(); }
   const vgo = t.closest("[data-view-go]");
   if (vgo) return setView(vgo.dataset.viewGo);
   const snooze = t.closest("[data-snooze]");

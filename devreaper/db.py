@@ -6,6 +6,8 @@ import threading
 import time
 from pathlib import Path
 
+from .redact import redact
+
 DEFAULTS = {
     "auto_enabled": True,
     "auto_interval_hours": 24,
@@ -18,6 +20,8 @@ DEFAULTS = {
     # Extra folders to search for repos. Usually empty: projects are discovered from where agents work.
     "project_roots": [],
     "ram_alert_percent": 90,
+    # close the browser Playwright MCP (or another automation tool) left open after this many idle minutes; 0 = off
+    "close_idle_browser_minutes": 30,
     # notification bookkeeping (not editable from the panel)
     "kernel_alert_at": 0,
     "kernel_snooze_until": 0,
@@ -77,6 +81,12 @@ class DB:
             names += [n for n in DEV_NAMES_V2 if n not in names]
             self._conn.execute("UPDATE settings SET value = ? WHERE key = 'dev_names'", (json.dumps(names),))
         self._conn.execute("INSERT OR IGNORE INTO settings VALUES ('_dev_names_v2', 'true')")
+        if not self._conn.execute("SELECT 1 FROM settings WHERE key = '_redacted_v1'").fetchone():
+            # command lines logged before secrets were masked
+            rows = self._conn.execute("SELECT id, cmd FROM kill_log WHERE cmd != ''").fetchall()
+            self._conn.executemany("UPDATE kill_log SET cmd = ? WHERE id = ?",
+                                   [(redact(cmd), i) for i, cmd in rows if redact(cmd) != cmd])
+            self._conn.execute("INSERT INTO settings VALUES ('_redacted_v1', 'true')")
         self._conn.commit()
 
     def _exec(self, sql, args=()):
@@ -141,7 +151,7 @@ class DB:
             "INSERT INTO kill_log (ts, label, pids, ports, mb, age_hours, reason, origin, cmd)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (time.time(), group["label"], json.dumps(group["pids"]), json.dumps(group["ports"]),
-             group["mb"], group["age_hours"], reason, origin, group.get("cmd", "")),
+             group["mb"], group["age_hours"], reason, origin, redact(group.get("cmd", ""))),
         )
 
     def kill_log(self, limit=40):

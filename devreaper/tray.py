@@ -16,6 +16,8 @@ MAX_AGENTS = 12
 MAX_PORTS = 12
 KERNEL_LINE_MB = 2048  # show the leak in the menu from this size on
 SPAWNING = 1.0         # processes per minute above which an idle agent is "still launching processes"
+BROWSER_TIP_MB = 4096  # suggest the browser's memory saver from this size on
+BROWSER_LABELS = {"chrome.exe": "Chrome", "msedge.exe": "Edge", "brave.exe": "Brave"}
 
 
 def gb(mb):
@@ -103,6 +105,8 @@ def group_entry(g, url):
         sub.append(item(f"El cierre automático lo salta: {g['keep_reason']}", enabled=False))
     sub.append(SEP)
     sub += [item(f"Abrir localhost:{p}", ("open", f"http://localhost:{p}")) for p in g["ports"][:3]]
+    if g.get("browser"):
+        sub.append(item(f"Cerrar solo el navegador (libera {gb(g['browser']['mb'])})", ("close-browser", {"id": g["id"]})))
     if g.get("excluded"):
         sub.append(item("Protegido: tiene un puerto con candado", enabled=False))
     else:
@@ -150,7 +154,9 @@ def kernel_entries(k, url):
         sub = []
         if k.get("growth_mb_day") and k["growth_mb_day"] > 0:
             sub.append(item(f"Crece {gb(k['growth_mb_day'])} al día", enabled=False))
-        if k.get("eta_hours"):
+        if k.get("eta_hours") == 0:
+            sub.append(item("Ya pasaste el 90 % de RAM o de memoria comprometida", enabled=False))
+        elif k.get("eta_hours"):
             when = time.strftime("%d/%m %H:%M", time.localtime(time.time() + k["eta_hours"] * 3600))
             sub.append(item(f"A este ritmo llegas al 90 % el {when}", enabled=False))
         if k.get("uptime_hours"):
@@ -163,6 +169,12 @@ def kernel_entries(k, url):
         out.append(item(f"Memoria comprometida {k['commit_pct']:.0f} % ({gb(k['commit_mb'])} de "
                         f"{gb(k['commit_limit_mb'])})", enabled=False))
     return out
+
+
+def browser_tips(browsers):
+    """'Chrome 5.7 GB — activar el ahorro de memoria' for each heavy browser that has such a setting."""
+    return [item(f"{BROWSER_LABELS[name]} usa {gb(mb)} — activar su ahorro de memoria", ("browser-settings", {"browser": name}))
+            for name, mb in sorted(browsers.items(), key=lambda kv: -kv[1]) if name in BROWSER_LABELS and mb >= BROWSER_TIP_MB]
 
 
 def menu_model(state, url):
@@ -181,6 +193,7 @@ def menu_model(state, url):
              + (f" · Navegadores {gb(live['browsers_mb'])}" if live.get("browsers_mb") else ""),
              enabled=False),
         *kernel_entries(state.get("kernel") or {}, url),
+        *browser_tips(live.get("browsers") or {}),
         SEP,
         item(f"Procesos ({len(groups)})", children=[group_entry(g, url) for g in groups[:MAX_GROUPS]]
              + ([SEP, item(f"… y {len(groups) - MAX_GROUPS} más en el panel", ("open", url))]

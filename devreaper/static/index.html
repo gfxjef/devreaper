@@ -49,6 +49,7 @@
 
     <div class="facts" id="facts"></div>
     <div class="banner kernel" id="kernel-banner" hidden></div>
+    <div class="banner browser-hint" id="browser-tip" hidden></div>
 
     <div class="toolbar" id="toolbar">
       <input type="search" class="filter" id="filter" placeholder="Filtrar ( / )" aria-label="Filtrar">
@@ -174,6 +175,7 @@
             <label>Mostrar si usa más de (MB)<input type="number" min="1" data-setting="show_min_mb"></label>
             <label>Mostrar si lleva abierto más de (horas)<input type="number" min="1" data-setting="show_min_age_hours"></label>
             <label>Avisar si la RAM pasa de (%)<input type="number" min="50" max="99" data-setting="ram_alert_percent"></label>
+            <label>Cerrar el navegador de Playwright tras (minutos sin uso, 0 = nunca)<input type="number" min="0" max="1440" data-setting="close_idle_browser_minutes"></label>
           </div>
 
           <h2>Proyectos</h2>

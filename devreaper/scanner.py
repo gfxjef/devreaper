@@ -7,6 +7,7 @@ import psutil
 
 from . import agents as agents_mod
 from .infra import INFRA_NAMES
+from .redact import redact
 from .worktrees import worktree_of
 
 NCPU = psutil.cpu_count() or 1
@@ -15,6 +16,10 @@ GROUP_ACTIVE = 0.015  # CPU share of one core above which a dev server counts as
 IGNORE_FRAGMENTS = ("\\adobe\\",)
 # Everyday browsers get their own band in the RAM chart. Playwright's Chromium is a dev process, not a browser.
 BROWSER_NAMES = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe"}
+# A browser started by an automation tool (Playwright, Puppeteer…) inside a dev group. Closing it frees its RAM;
+# Playwright MCP opens a new one on its next call.
+AUTOMATED_EXES = BROWSER_NAMES | {"chrome-headless-shell.exe", "headless_shell.exe"}
+AUTOMATION_MARKS = ("--remote-debugging-pipe", "--remote-debugging-port", "--enable-automation", "ms-playwright")
 GENERIC_DIRS = {"frontend", "backend", "web", "app", "client", "server", "api", "src"}
 WORKTREE_RE = re.compile(r"([^\\/\"]+)[\\/]\.worktrees[\\/]([^\\/\"\s]+)", re.I)
 NODE_MODULES_RE = re.compile(r"([^\\/\"]+)[\\/]([^\\/\"]+)[\\/]node_modules[\\/]", re.I)
@@ -297,16 +302,52 @@ def build_agents(procs, found, user, activity, settings, now):
 
 
 def browsers_mb(procs, skip):
-    """RAM of everyday browsers (every process of Chrome, Edge, Firefox…), excluding PIDs in `skip`."""
-    total = 0.0
+    """{exe name: MB} of everyday browsers (every process of Chrome, Edge, Firefox…), excluding PIDs in `skip`."""
+    out = {}
     for pid, rec in procs.items():
-        if pid in skip or rec["name"].lower() not in BROWSER_NAMES:
+        name = rec["name"].lower()
+        if pid in skip or name not in BROWSER_NAMES:
             continue
         try:
-            total += rec["proc"].memory_info().rss / 2**20
+            out[name] = out.get(name, 0.0) + rec["proc"].memory_info().rss / 2**20
         except psutil.Error:
             continue
-    return round(total, 1)
+    return {k: round(v, 1) for k, v in out.items()}
+
+
+_args_cache = {}
+
+
+def _args(rec):
+    key = (rec["pid"], rec["create_time"])
+    hit = _args_cache.get(key)
+    if hit is None:
+        try:
+            hit = rec.get("cmd") or " ".join(rec["proc"].cmdline())
+        except psutil.Error:
+            hit = ""
+        if len(_args_cache) > 2000:
+            _args_cache.clear()
+        _args_cache[key] = hit
+    return hit
+
+
+def automated_browser(pids, procs, children):
+    """{'pid', 'create_time', 'pids', 'mb'} of the automation browser among a group's PIDs, or None."""
+    for pid in pids:
+        rec = procs.get(pid)
+        if rec is None or rec["name"].lower() not in AUTOMATED_EXES:
+            continue
+        parent = parent_of(rec, procs)
+        if parent is not None and parent["name"].lower() in AUTOMATED_EXES:
+            continue  # a renderer or GPU helper: the root is its parent
+        args = _args(rec).lower()
+        if not any(mark in args for mark in AUTOMATION_MARKS):
+            continue
+        tree = [pid] + descendants(pid, children, set())
+        return {"pid": pid, "create_time": rec["create_time"], "pids": tree,
+                "mb": round(agents_mod.tree_mb(tree, procs), 1)}
+    return None
 
 
 def scan(settings, sessions, db, excluded_ports, self_pid=None, activity=None, extras=None):
@@ -433,7 +474,7 @@ def scan(settings, sessions, db, excluded_ports, self_pid=None, activity=None, e
             "pids": pids,
             "label": label or root["name"],
             "kind": kind,
-            "cmd": root["cmd"][:300],
+            "cmd": redact(root["cmd"])[:300],
             "ports": ports,
             "exposed": exposed,
             "worktree": wt,
@@ -450,11 +491,13 @@ def scan(settings, sessions, db, excluded_ports, self_pid=None, activity=None, e
                         "agent": session.get("agent") or "Claude Code", "kind": session.get("kind") or "cli"}
             if session else None,
             "visible": mb >= settings["show_min_mb"] or age_h >= settings["show_min_age_hours"] or state == "orphan",
+            "browser": automated_browser(pids, procs, children),
         })
     out.sort(key=lambda g: g["mb"], reverse=True)
     if extras is not None:
         in_groups = {pid for g in out for pid in g["pids"]}
-        extras.update(browsers_mb=browsers_mb(procs, in_groups | set(member_of)), member_of=dict(member_of),
+        browsers = browsers_mb(procs, in_groups | set(member_of))
+        extras.update(browsers_mb=round(sum(browsers.values()), 1), browsers=browsers, member_of=dict(member_of),
                       own=frozenset(own))
     live |= {("agent", pid, a["create_time"]) for pid, a in agents.items()}
     activity.forget(live)

@@ -64,6 +64,9 @@ def make_server(app, port=PORT):
                 return self._json(200, app.state())
             if url.path == "/api/live":
                 return self._json(200, app.live())
+            if url.path == "/api/ports":
+                # cheap answer for status lines and mods: which local TCP ports are listening (rescanned every 2 s)
+                return self._json(200, {"listening": app.listening_ports(), "scanned_at": app.scanned_at()})
             if url.path == "/api/ram":
                 try:
                     hours = min(max(float(parse_qs(url.query).get("hours", ["168"])[0]), 1), 168)

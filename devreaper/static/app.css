@@ -132,6 +132,14 @@ input:focus-visible, button:focus-visible, summary:focus-visible, a:focus-visibl
 .launchers td.r { text-align: right; white-space: nowrap; }
 .launchers .bar { height: 4px; border-radius: 2px; background: var(--s-kernel); margin-top: 4px; min-width: 2px; }
 .spawning { color: var(--inactive); font-weight: 600; }
+.banner.browser-hint { border-color: color-mix(in srgb, var(--s-browsers) 45%, var(--line));
+              background: color-mix(in srgb, var(--s-browsers) 7%, var(--surface)); }
+.repeated { margin: 8px 0 0; padding: 0; list-style: none; font-size: 13px; }
+.repeated li { display: flex; gap: 10px; align-items: baseline; padding: 4px 0; border-top: 1px solid var(--line-soft); }
+.repeated code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                 font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }
+.repeated .who { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
+.card.sys h4 { margin: 12px 0 0; font-size: 13px; font-weight: 600; }
 .area { stroke: var(--surface); stroke-width: 1.5; stroke-linejoin: round; }
 .live .area { stroke: var(--bg); }
 .gridline { stroke: var(--grid); stroke-width: 1; }
